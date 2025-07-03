@@ -10,6 +10,7 @@ output:
       collapsed: false
     toc_depth: 4
     code_folding: hide
+    self_contained: true
 ---
 
 ```{r setup}
@@ -44,15 +45,6 @@ patho_scores_raw <- read_sheet(
   rename(
     Albumin = `Albumin (tubule)`
   )
-
-# clinical_scores_raw <- read_sheet(
-#   "https://docs.google.com/spreadsheets/d/1eATs2B_xOC9rx1VN9dDIbHpNp9iPk6Q7hrkl8zfP9Dk/edit?gid=0#gid=0",
-#   sheet = 2
-# ) %>%
-#   drop_na(`LSP ID`) %>%
-#   rename(
-#     C3 = `C3 Glom`
-#   )
 
 orion_quants_and_clinical_raw <- read_sheet(
   "https://docs.google.com/spreadsheets/d/1a1nLyFQNTJYoVWLX9JS2wIItvTqnxLVJ30NXdnLd7AE/edit?gid=382231029#gid=382231029",
@@ -171,7 +163,18 @@ orion_quants <- orion_quants_raw %>%
   ) %>%
   mutate(
     log_expression = log10(expression)
-  )
+  ) %>%
+  group_by(marker) %>%
+  mutate(
+    log_expression_deciles = cut(
+      log_expression,
+      breaks = c(-Inf, quantile(log_expression, probs = seq(0.2, .8, 0.2), type = 8), Inf),
+      labels = 1:5,
+      include.lowest = TRUE,
+      ordered_result = TRUE
+    )
+  ) %>%
+  ungroup()
 ```
 
 Checking `LSP ID` overlap between the datasets
@@ -183,7 +186,9 @@ setdiff(orion_quants$`LSP ID`, scores_all$`LSP ID`)
 
 All `LSP ID`s are present in both datasets as expected.
 
-## Confusion matrices
+## Comparing pathologist and clinical scores
+
+### Confusion matrices
 
 ```{r}
 scores_confusion <- scores_all %>%
@@ -215,7 +220,7 @@ p <- scores_confusion %>%
 p
 ```
 
-## Cohen’s Kappa Statistic
+### Cohen’s Kappa Statistic
 
 Purpose: Measures the agreement between two raters
 (in this case, the pathologist and the algorithm) beyond what would be expected by chance.
@@ -315,7 +320,7 @@ p
 ```
 
 
-## Ordinal mixed model
+### Ordinal mixed model
 
 While Kappa gives you a measurement for agreement, it doesn't tell you what the
 differences are when there is disagreement. We can use an ordinal mixed model
@@ -360,6 +365,7 @@ dt_default_table(
 )
 ```
 
+### Ordinal mixed model plot
 
 ```{r}
 p <- mods_df %>%
@@ -371,11 +377,14 @@ p <- mods_df %>%
   labs(
     y = NULL,
     title = "Difference in mean scores between pathologist and clinical report",
-    subtitle = "Positive values mean pathologist scores higher, negative values mean pathologist scores lower"
   )
 
 p
 ```
+
+Positive values mean pathologist scores higher, negative values mean pathologist
+scores lower than the clinical report scores.
+
 
 ## Relating scores with Orion quants
 
@@ -397,9 +406,17 @@ orion_vs_scores_all <- power_inner_join(
   ) %>%
   ungroup() %>%
   clean_names()
+
+orion_vs_scores_all_cor_data <- bind_rows(
+  orion_vs_scores_all %>%
+    filter(both_sources),
+  orion_vs_scores_all %>%
+    filter(source == "clinical") %>%
+    mutate(source = "clinical_all")
+)
 ```
 
-### Plots
+### Boxplots
 
 ```{r, fig.width = 16, fig.height = 8, dpi = 200}
 p <- orion_vs_scores_all %>%
@@ -416,10 +433,15 @@ p <- orion_vs_scores_all %>%
     shape = 16,
     width = .3
   ) +
+  geom_boxplot(
+    aes(color = NULL),
+    outliers = FALSE,
+    fill = NA_character_
+  ) +
   scale_color_manual(
     values = c(
       both = alpha("black", .7),
-      single = alpha("black", .1)
+      single = alpha("black", .3)
     )
   ) +
   ggh4x::facet_grid2(vars(source), vars(marker), scales = "free_y", independent = "y") +
@@ -431,8 +453,41 @@ p <- orion_vs_scores_all %>%
 p
 ```
 
+### Confusion matrix plot
 
-### `cocor`
+Confusion matrix of the scores from the pathologist and the clinical report
+against the Orion quant quantiles that are used to compute the Kappa
+correlation.
+
+```{r, fig.width = 16, fig.height = 7, dpi = 200}
+p <- orion_vs_scores_all_cor_data %>%
+  drop_na(score, log_expression_deciles) %>%
+  count(source, marker, score, log_expression_deciles) %>%
+  complete(
+    source, marker, score, log_expression_deciles,
+    fill = list(n = 0)
+  ) %>%
+  ggplot(aes(x = score, y = log_expression_deciles, fill = n)) +
+  geom_raster() +
+  geom_text(
+    aes(label = n),
+    color = "white"
+  ) +
+  scale_fill_continuous(
+    trans = scales::transform_pseudo_log()
+  ) +
+  facet_grid(source ~ marker) +
+  coord_equal() +
+  labs(
+    x = "Score",
+    y = "Orion expression quantiles",
+    fill = "Count"
+  )
+
+p
+```
+
+### Correlations
 
 `cocor` is a package that can be used to compare correlation coefficients between
 two groups. Here we are using it to compare which one compares stronger with the
@@ -442,11 +497,10 @@ We use Kendall correlation here, since the scores are ordinal and we have lots
 of ties in the data.
 
 ```{r}
-orion_vs_scores_all_cor_raw <- orion_vs_scores_all %>%
-  filter(both_sources) %>%
+orion_vs_scores_all_cor_raw <- orion_vs_scores_all_cor_data %>%
   group_by(source, marker) %>%
   summarize(
-    res = list(
+    kendall = list(
       cor.test(
         log_expression,
         as.integer(score),
@@ -463,11 +517,20 @@ orion_vs_scores_all_cor_raw <- orion_vs_scores_all %>%
             as_tibble()
         )
     ),
+    kappa = list(
+      irr::kappa2(
+        tibble(score, log_expression_deciles),
+        weight = "equal"
+      ) %>%
+        magrittr::set_class("list") %>%
+        as.data.frame() %>%
+        select(kappa = value, p.value)
+    ),
     .groups = "drop"
-  ) %>%
-  unnest(res)
+  )
 
 orion_vs_scores_cross_cor <- orion_vs_scores_all %>%
+   # Arbitrary
   filter(marker == "IgG", both_sources) %>%
   transmute(
     lsp_id, source,
@@ -482,23 +545,44 @@ orion_vs_scores_cross_cor <- orion_vs_scores_all %>%
   } %>%
   tidy()
 
-orion_vs_scores_all_cocor <- orion_vs_scores_all_cor_raw %>%
-  select(-c(method, alternative)) %>%
-  pivot_wider(names_from = "source", values_from = -c(marker)) %>%
+orion_vs_scores_kendall <- orion_vs_scores_all_cor_raw %>%
+  select(source, marker, kendall) %>%
+  unnest(kendall) %>%
+  select(-c(method, alternative, tau_b, statistic))
+
+orion_vs_scores_kappa <- orion_vs_scores_all_cor_raw %>%
+  select(source, marker, kappa) %>%
+  unnest(kappa)
+
+orion_vs_scores_all_cocor <- tibble(
+  comparison_1 = c("pathologist", "pathologist"),
+  comparison_2 = c("clinical", "clinical_all")
+) %>%
+  inner_join(
+    orion_vs_scores_kendall,
+    by = c("comparison_1" = "source"),
+    relationship = "many-to-many"
+  ) %>%
+  inner_join(
+    orion_vs_scores_kendall,
+    by = c("comparison_2" = "source", "marker"),
+    suffix = c("_pathologist", "_clinical"),
+    relationship = "many-to-many"
+  ) %>%
+  rowwise() %>%
   mutate(
-    res = map2(
-      estimate_clinical, estimate_pathologist,
-      \(x, y) cocor::cocor.dep.groups.overlap(
-        r.jk = x,
-        r.jh = y,
+    res = list(
+      cocor::cocor.dep.groups.overlap(
+        r.jk = estimate_clinical,
+        r.jh = estimate_pathologist,
         r.kh = orion_vs_scores_cross_cor$estimate,
         n = 53
       )
-    ),
-    res_df = map(
-      res,
-      \(x) as_tibble(x@olkin1967)
     )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    res_df = map(res, \(x) as_tibble(x@olkin1967))
   )
 
 orion_vs_scores_all_cocor_df <- orion_vs_scores_all_cocor %>%
@@ -506,14 +590,41 @@ orion_vs_scores_all_cocor_df <- orion_vs_scores_all_cocor %>%
   unnest(res_df)
 ```
 
-#### `cocor` table
+#### Correlation tables
+
+##### Kendall correlation
+
+```{r}
+dt_default_table(
+  orion_vs_scores_kendall
+)
+```
+
+Kendall correlations between clinical/pathologist scores and Orion
+quantifications. `estimate` is the Tau-b correlation coefficient, `source` is
+indicating the source of the scores.
+
+##### Kappa correlation
+
+```{r}
+dt_default_table(
+  orion_vs_scores_kappa
+)
+```
+
+Kappa correlations between clinical/pathologist scores and Orion
+quantifications. For this purpose Orion quantifications were binned into
+five equally sized bins (quantiles).
+
+##### `cocor` comparison
 
 ```{r}
 orion_vs_scores_all_cocor_df %>%
   select(
     marker,
+    comparison = comparison_2,
     starts_with(
-      fixed(c("tau_b_", "p.value_", "lwr.ci", "upr.ci"))
+      fixed(c("estimate_", "p.value_"))
     ),
     p.value
   ) %>%
@@ -522,8 +633,8 @@ orion_vs_scores_all_cocor_df %>%
 
 Comparing correlations between the pathologist and the clinical report with the
 Orion quants. In this table with have the individual correlation coefficients
-(`tau_b_clinical` and `tau_b_pahtologist`) and their 95% confidence intervals
-(`lwr.ci` and `upr.ci`), as well as p-values for the individual correlations
+(`estimate__clinical` and `estimate__pathologist`) as well as p-values for the
+individual correlations
 (`p.value_clinical` and `p.value_pathologist`). These tell you if the individual
 correlations are significantly different from 0.
 
@@ -537,14 +648,18 @@ based on dependent groups (e.g., the same group). The two correlations are
 overlapping, i.e., they have one variable in common."). The test is based on
 Olkin's z from https://doi.org/10.3102/00028312007002189.
 
-#### `cocor` plot
+#### Correlation plot Kendall
 
 ```{r fig.width = 5, fig.height = 4, dpi = 200}
-p <- orion_vs_scores_all_cor_raw %>%
+p <- orion_vs_scores_kendall %>%
   ggplot(
     aes(
       x = source, y = estimate
     )
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dotted"
   ) +
   geom_line(
     aes(group = marker)
@@ -557,22 +672,27 @@ p <- orion_vs_scores_all_cor_raw %>%
   ) +
   geom_bracket(
     aes(
-      xmin = source_clinical,
-      xmax = source_pathologist,
+      xmin = comparison_1,
+      xmax = comparison_2,
       label = signif(p.value, 2)
     ),
     data = orion_vs_scores_all_cocor_df,
     y.position = .75,
-    label.size = 2.5
+    label.size = 2.5,
+    step.increase = .2,
+    step.group.by = "marker"
   ) +
   facet_wrap(~marker) +
-  scale_color_discrete(guide = "none") +
+  ggokabeito::scale_color_okabe_ito(guide = "none") +
   scale_y_continuous(
     expand = expansion(mult = c(.05, .15))
   ) +
   labs(
     x = NULL,
     y = "Kendall's tau correlation"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
   )
 
 p
@@ -584,6 +704,48 @@ lines show the 95% confidence intervals for the correlation coefficients. The
 brackets show the p-values for the difference between the two correlation
 coefficients. If the p-value is < 0.05, the correlation coefficients are
 significantly different.
+
+#### Correlation plot Kappa
+
+```{r fig.width = 5, fig.height = 4, dpi = 200}
+p <- orion_vs_scores_kappa %>%
+  ggplot(
+    aes(
+      x = source, y = kappa
+    )
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dotted"
+  ) +
+  geom_line(
+    aes(group = marker)
+  ) +
+  geom_segment(
+    aes(
+      xend = source
+    ),
+    linetype = "dashed",
+    yend = 0
+  ) +
+  geom_point(
+    aes(color = source)
+  ) +
+  facet_wrap(~marker) +
+  ggokabeito::scale_color_okabe_ito(guide = "none") +
+  scale_y_continuous(
+    expand = expansion(mult = c(.05, .15))
+  ) +
+  labs(
+    x = NULL,
+    y = "Kendall's tau correlation"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+p
+```
 
 ### Bayesian models
 
