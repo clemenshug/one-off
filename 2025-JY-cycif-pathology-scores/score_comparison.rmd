@@ -33,6 +33,9 @@ library(here)
 theme_set(
   theme_minimal(base_family = "Helvetica")
 )
+
+fig_dir <- here("figures")
+dir.create(fig_dir, showWarnings = FALSE)
 ```
 
 ## Loading data
@@ -112,48 +115,43 @@ markers <- reduce(
 ) %>%
   setdiff(c("LSP ID"))
 
-score_order <- c("0", "0.5", "1", "2", "3", "4")
-score_mapping <- c(
-  `0.25` = "0.5",
-  `0.75` = "1",
-  `1.5` = "2"
-)
+score_order <- c("0", "0.5", "1", "2", "3+")
+marker_order <- c("IgG", "IgA", "IgM", "Kappa LC", "Lambda LC", "C3", "C1q", "Fibrinogen", "Albumin")
 
 scores_all <- bind_rows(
-  pathologist = patho_scores_raw %>%
-    transmute(
-      `LSP ID`,
-      across(
-        all_of(markers),
-        \(x) as.character(str_remove(x, fixed("+")))
-      )
-    ),
-  clinical = clinical_scores_raw %>%
-    transmute(
-      `LSP ID`,
-      across(
-        all_of(markers),
-        \(x) as.character(x) %>%
-          recode(
-            !!!score_mapping
-          )
-      )
-    ),
+  list(
+    pathologist = patho_scores_raw,
+    clinical = clinical_scores_raw
+  ) %>%
+    map(\(x) mutate(x, across(all_of(markers), as.character))),
   .id = "source"
 ) %>%
+  select(`LSP ID`, source, all_of(markers)) %>%
   pivot_longer(
-    -c(`LSP ID`, source),
+    all_of(markers),
     names_to = "marker",
-    values_to = "score"
+    values_to = "score_original"
   ) %>%
   mutate(
-    across(score, \(x) factor(x, levels = score_order, ordered = TRUE))
+    score = str_remove_all(score_original, fixed("+")) %>%
+      as.numeric() %>%
+      cut(
+        breaks = c(-Inf, .1, .75, 1.5, 2.5, Inf),
+        labels = score_order,
+        right = FALSE,
+        ordered_result = TRUE
+      ),
+    marker = factor(
+      marker,
+      levels = marker_order
+    )
   ) %>%
   group_by(`LSP ID`, marker) %>%
   mutate(
     both_sources = n_distinct(source) == 2
   ) %>%
-  ungroup()
+  ungroup() %>%
+  select(-score_original)
 
 orion_quants <- orion_quants_raw %>%
   pivot_longer(
@@ -162,7 +160,11 @@ orion_quants <- orion_quants_raw %>%
     values_to = "expression"
   ) %>%
   mutate(
-    log_expression = log10(expression)
+    log_expression = log10(expression),
+    marker = factor(
+      marker,
+      levels = marker_order
+    )
   ) %>%
   group_by(marker) %>%
   mutate(
@@ -431,26 +433,34 @@ p <- orion_vs_scores_all %>%
   geom_quasirandom(
     orientation = "x",
     shape = 16,
-    width = .3
+    width = .3,
+    alpha = 0.6
   ) +
   geom_boxplot(
     aes(color = NULL),
     outliers = FALSE,
     fill = NA_character_
   ) +
-  scale_color_manual(
-    values = c(
-      both = alpha("black", .7),
-      single = alpha("black", .3)
-    )
+  paletteer::scale_color_paletteer_d("ggsci::category10_d3") +
+  ggh4x::facet_grid2(
+    vars(source), vars(marker),
+    scales = "free_y", independent = "y", axes = "all"
   ) +
-  ggh4x::facet_grid2(vars(source), vars(marker), scales = "free_y", independent = "y") +
+  envalysis::theme_publish() +
+  theme(
+    legend.position = "right"
+  ) +
   labs(
     x = "Score",
     y = "log10(expression)",
     color = "Sample in"
   )
 p
+
+ggsave(
+  file.path(fig_dir, "orion_vs_scores_boxplot.pdf"),
+  p, width = 16, height = 6
+)
 ```
 
 ### Confusion matrix plot
@@ -762,18 +772,17 @@ pathologist's scores or the clinical report's scores.
 
 ```{r}
 orion_vs_scores_model_input <- orion_vs_scores_all %>%
-  filter(both_sources) %>%
   group_nest(source, marker)
 
 if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
   mod1 <- brm(
     score ~ log_expression + (1 | lsp_id),
-    data = orion_vs_scores_model_input$data[[1]],
+    data = orion_vs_scores_model_input$data[[4]],
     family = cumulative(link = "logit", threshold = "flexible"),
-    prior = c(set_prior(prior = "normal(0,10)", class = "Intercept"),
-              set_prior(prior = "normal(0,10)", class = "b"),
+    prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
+              set_prior(prior = "normal(0,5)", class = "b"),
               set_prior(prior = "cauchy(0,5)", class = "sd")),
-    iter = 4000,
+    iter = 8000,
     control = list(max_treedepth = 15, adapt_delta = 0.99),
     cores = 4,
     seed = 42,
