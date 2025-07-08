@@ -771,13 +771,76 @@ performs better, i.e. whether the Orion quants are better at predicting the
 pathologist's scores or the clinical report's scores.
 
 ```{r}
-orion_vs_scores_model_input <- orion_vs_scores_all %>%
-  group_nest(source, marker)
+mod1 <- brm(
+  score ~ log_expression + (1 | lsp_id),
+  data = orion_vs_scores_model_input$data[[4]],
+  family = cumulative(link = "logit", threshold = "flexible"),
+  prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
+            set_prior(prior = "normal(0,5)", class = "b"),
+            set_prior(prior = "cauchy(0,5)", class = "sd")),
+  iter = 8000,
+  control = list(max_treedepth = 15, adapt_delta = 0.99),
+  cores = 4,
+  seed = 42,
+  save_pars = save_pars(all = TRUE)
+) %>%
+  add_criterion("loo", moment_match = TRUE)
 
-if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
-  mod1 <- brm(
+mod2 <- brm(
+  score ~ log_expression,
+  data = orion_vs_scores_model_input$data[[4]],
+  family = cumulative(link = "logit", threshold = "flexible"),
+  prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
+            set_prior(prior = "normal(0,5)", class = "b"),
+            set_prior(prior = "cauchy(0,5)", class = "sd")),
+  iter = 8000,
+  control = list(max_treedepth = 15, adapt_delta = 0.99),
+  cores = 4,
+  seed = 42,
+  save_pars = save_pars(all = TRUE)
+) %>%
+  add_criterion("loo", moment_match = TRUE)
+
+mod3 <- brm(
+  score ~ log_expression,
+  data = orion_vs_scores_model_input$data[[4]],
+  family = cumulative(link = "cauchit", threshold = "flexible"),
+  prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
+            set_prior(prior = "normal(0,5)", class = "b")),
+  iter = 8000,
+  control = list(max_treedepth = 15, adapt_delta = 0.99),
+  cores = 4,
+  seed = 42,
+  save_pars = save_pars(all = TRUE)
+) %>%
+  add_criterion("loo", moment_match = TRUE)
+
+mod4 <- brm(
+  bf(score ~ log_expression, disc ~ 1),
+  data = orion_vs_scores_model_input$data[[4]],
+  family = cumulative(link = "logit", threshold = "flexible"),
+  prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
+            set_prior(prior = "normal(0,5)", class = "b"),
+            set_prior(prior = "normal(0, 1)", class = "Intercept", dpar = "disc")),
+  iter = 8000,
+  control = list(max_treedepth = 15, adapt_delta = 0.99),
+  cores = 4,
+  seed = 42,
+  save_pars = save_pars(all = TRUE)
+) %>%
+  add_criterion("loo", moment_match = TRUE)
+
+loo_compare(mod1, mod2, mod3, mod4)
+```
+
+Model with observation-level random effects (mod1) is the best model according to
+the LOO criterion.
+
+```{r}
+fit_model <- function(data) {
+  brm(
     score ~ log_expression + (1 | lsp_id),
-    data = orion_vs_scores_model_input$data[[4]],
+    data = data,
     family = cumulative(link = "logit", threshold = "flexible"),
     prior = c(set_prior(prior = "normal(0,5)", class = "Intercept"),
               set_prior(prior = "normal(0,5)", class = "b"),
@@ -788,6 +851,14 @@ if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
     seed = 42,
     save_pars = save_pars(all = TRUE)
   )
+}
+
+orion_vs_scores_model_input <- orion_vs_scores_all %>%
+  group_nest(source, marker)
+
+if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
+  mod1 <- fit_model(orion_vs_scores_model_input$data[[1]]) %>%
+    add_criterion("loo", moment_match = TRUE)
 
   orion_vs_scores_models <- orion_vs_scores_model_input %>%
     rowwise() %>%
@@ -796,62 +867,28 @@ if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
         update(
           mod1,
           newdata = data,
-          iter = 4000,
+          iter = 8000,
           control = list(max_treedepth = 15, adapt_delta = 0.99),
           cores = 4,
           seed = 42,
           save_pars = save_pars(all = TRUE)
-        )
+        ) %>%
+          add_criterion("loo", moment_match = TRUE)
       )
     ) %>%
     ungroup()
 
   qsave(
     orion_vs_scores_models,
-    here("orion_vs_scores_models.qs")
-  )
-
-  orion_vs_scores_model_loos <- orion_vs_scores_models %>%
-    mutate(
-      across(mod, \(x) map(x, \(y) add_criterion(y, "loo", moment_match = TRUE)))
-    )
-
-  qsave(
-    orion_vs_scores_model_loos,
     here("orion_vs_scores_model_loos.qs")
   )
 } else {
-  orion_vs_scores_model_loos <- qread(here("orion_vs_scores_model_loos.qs"))
+  orion_vs_scores_models <- qread(here("orion_vs_scores_model_loos.qs"))
 }
-
-orion_vs_scores_model_loo_compare_raw <- orion_vs_scores_model_loos %>%
-  select(-data) %>%
-  pivot_wider(
-    names_from = source, values_from = mod
-  ) %>%
-  mutate(
-    comp = map2(
-      pathologist, clinical,
-      \(x, y) loo_compare(
-        x, y,
-        criterion = "loo",
-        model_names = c("pathologist", "clinical")
-      )
-    )
-  ) %>%
-  select(-c(clinical, pathologist))
-
-orion_vs_scores_model_loo_compare <- orion_vs_scores_model_loo_compare_raw %>%
-  mutate(
-    across(comp, \(x) map(x, \(y) as_tibble(y, rownames = "model")))
-  ) %>%
-  unnest(comp)
-
 ```
 
-
 ```{r}
-post_draws <- orion_vs_scores_model_loos %>%
+post_draws <- orion_vs_scores_models %>%
   rowwise() %>%
   mutate(
     draws = list(
@@ -867,6 +904,9 @@ post_draws <- orion_vs_scores_model_loos %>%
   ungroup() %>%
   select(-c(data, mod)) %>%
   unnest(draws)
+
+
+
 ```
 
 #### Plot Orion quant as predictor
@@ -883,27 +923,336 @@ p <- post_draws %>%
   ) +
   stat_lineribbon(
     aes(
-      fill = .category
+      fill = stage(.category, after_scale = alpha(fill, .15))
+    ),
+    .width = c(.95)
+  ) +
+  # geom_vline(
+  #   data = thresholds_mean,
+  #   aes(xintercept = value),
+  #   linetype = "dashed",
+  #   alpha = 0.5,
+  #   show.legend = FALSE
+  # ) +
+  ggh4x::facet_grid2(
+    source ~ marker,
+    scales = "free_x",
+    independent = "x",
+    axes = "all"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format()
+  ) +
+  envalysis::theme_publish() +
+  coord_cartesian(
+    expand = FALSE
+  ) +
+  labs(
+    x = "log10(expression)",
+    y = "Probability",
+    title = "Predicted scores from Orion quants",
+    fill = "Score",
+    color = "Score"
+  )
+
+p
+
+ggsave(
+  file.path(fig_dir, "score_pred_model_probability_curves.pdf"),
+  p, width = 30, height = 6
+)
+```
+
+The Bayesian model allows us to compute the probability of each score given some
+Orion quantification results. This plot shows the predicted probabilities of
+each clinical and pathologist score given the Orion quantification results.
+
+
+```{r}
+p <- post_draws %>%
+  mutate(across(.category, ordered)) %>%
+  ggplot(
+    aes(
+      x = log_expression,
+      y = .epred,
+      color = .category
+    )
+  ) +
+  stat_lineribbon(
+    aes(
+      fill = stage(.category, after_scale = alpha(fill, .15))
     ),
     .width = c(.95),
-    alpha = .25
+    position = "stack"
   ) +
+  ggh4x::facet_grid2(
+    source ~ marker,
+    scales = "free_x",
+    independent = "x",
+    axes = "all"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format()
+  ) +
+  envalysis::theme_publish() +
+  coord_cartesian(
+    expand = FALSE
+  ) +
+  labs(
+    x = "log10(expression)",
+    y = "Probability",
+    title = "Predicted scores from Orion quants",
+    fill = "Score",
+    color = "Score"
+  )
+
+p
+
+ggsave(
+  file.path(fig_dir, "score_pred_model_probability_curves_stacked.pdf"),
+  p, width = 30, height = 6
+)
+```
+
+
+#### Threshold plot
+
+```{r, fig.width = 14, fig.height = 6, dpi = 200}
+p <- thresholds %>%
+  ggplot(aes(x = expression_threshold, y = threshold_name)) +
+  stat_pointinterval() +
+  facet_grid(source ~ marker, scales = "free_x") +
+  labs(
+    x = "log10(expression) threshold",
+    y = "Score boundary",
+    title = "Model-estimated thresholds between score categories",
+    subtitle = "Points show posterior medians with 50% and 95% credible intervals"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p
+
+ggsave(
+  file.path(fig_dir, "score_thresholds.pdf"),
+  p, width = 14, height = 6
+)
+```
+
+
+### Frequentist model with expression as predictor
+
+We'll fit frequentist cumulative link mixed models (CLMMs) using the `ordinal` package, which is the frequentist equivalent of the Bayesian models above.
+
+```{r}
+fit_clmm_model <- function(data) {
+  clmm(
+    score ~ log_expression + (1 | lsp_id),
+    data = data,
+    link = "logit",
+    threshold = "flexible"
+  )
+}
+
+orion_vs_scores_clmm_models <- orion_vs_scores_model_input %>%
+  rowwise() %>%
+  mutate(
+    clmm_mod = list(fit_clmm_model(data)),
+    # Extract model summary
+    clmm_summary = list(summary(clmm_mod)),
+    # Extract AIC for model comparison
+    aic = AIC(clmm_mod),
+    # Extract coefficients using summary output which handles dimensions properly
+    coefs = list(
+      as_tibble(coef(summary(clmm_mod)), rownames = "coefficient") %>%
+        rename(
+          estimate = Estimate,
+          std_error = `Std. Error`,
+          z_value = `z value`,
+          p_value = `Pr(>|z|)`
+        )
+    )
+  ) %>%
+  ungroup()
+
+# Extract coefficient table for log_expression across all models
+clmm_coefficients <- orion_vs_scores_clmm_models %>%
+  select(source, marker, coefs) %>%
+  unnest(coefs) %>%
+  filter(coefficient == "log_expression")
+
+# Compare AICs between pathologist and clinical models
+clmm_aic_comparison <- orion_vs_scores_clmm_models %>%
+  select(source, marker, aic) %>%
+  pivot_wider(names_from = source, values_from = aic) %>%
+  mutate(
+    aic_diff = clinical - pathologist,
+    better_model = if_else(aic_diff < 0, "clinical", "pathologist")
+  )
+```
+
+#### CLMM coefficient table
+
+This shows the frequentist estimates for the effect of log expression on the ordinal scores.
+
+```{r}
+dt_default_table(clmm_coefficients)
+```
+
+#### AIC model comparison
+
+Comparing the Akaike Information Criterion (AIC) between pathologist and clinical models. Lower AIC indicates better model fit.
+
+```{r}
+dt_default_table(clmm_aic_comparison)
+```
+
+#### CLMM coefficient plot
+
+```{r, fig.width = 8, fig.height = 6, dpi = 200}
+p <- clmm_coefficients %>%
+  mutate(
+    ci_lower = estimate - 1.96 * std_error,
+    ci_upper = estimate + 1.96 * std_error,
+    marker = fct_reorder(marker, estimate)
+  ) %>%
+  ggplot(aes(x = estimate, y = marker, color = source)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange(
+    aes(xmin = ci_lower, xmax = ci_upper),
+    position = position_dodge(width = 0.3)
+  ) +
+  ggokabeito::scale_color_okabe_ito() +
+  labs(
+    x = "Coefficient estimate (log odds)",
+    y = "Marker",
+    color = "Source",
+    title = "Frequentist CLMM: Effect of log expression on ordinal scores",
+    subtitle = "Error bars show 95% confidence intervals"
+  ) +
+  theme(legend.position = "bottom")
+
+p
+```
+
+#### Predicted probabilities from CLMM
+
+Generate predicted probabilities across the range of log expression values for comparison with the Bayesian model.
+
+```{r}
+# Generate predictions for CLMM models
+clmm_predictions <- orion_vs_scores_clmm_models %>%
+  rowwise() %>%
+  mutate(
+    pred_data = list(
+      tibble(
+        log_expression = seq(min(data$log_expression), max(data$log_expression), length.out = 50)
+      )
+    ),
+    predictions = list(
+      # Get population-level predictions (marginal over random effects)
+      predict(clmm_mod, newdata = pred_data, type = "prob") %>%
+        as_tibble() %>%
+        bind_cols(pred_data) %>%
+        pivot_longer(
+          cols = starts_with(c("0", "1", "2", "3")),
+          names_to = "score_category",
+          values_to = "probability"
+        ) %>%
+        # Ensure proper ordering of score categories
+        filter(score_category %in% score_order) %>%
+        mutate(
+          score_category = factor(score_category, levels = score_order, ordered = TRUE)
+        )
+    )
+  ) %>%
+  ungroup() %>%
+  select(source, marker, predictions) %>%
+  unnest(predictions)
+```
+
+```{r, fig.width = 14, fig.height = 6, dpi = 200}
+p <- clmm_predictions %>%
+  ggplot(
+    aes(
+      x = log_expression,
+      y = probability,
+      color = score_category
+    )
+  ) +
+  geom_line(linewidth = 1) +
   facet_grid(
     source ~ marker,
     scales = "free_x"
   ) +
   labs(
     x = "log10(expression)",
-    y = "Probability of score",
-    title = "Predicted scores from Orion quants"
-  )
+    y = "Predicted probability",
+    color = "Score",
+    title = "Frequentist CLMM: Predicted score probabilities from Orion quants"
+  ) +
+  theme(legend.position = "bottom")
 
 p
+
+ggsave(
+  file.path(fig_dir, "clmm_score_pred_probability_curves.pdf"),
+  p, width = 22, height = 6
+)
 ```
 
-The Bayesian model allows us to compute the probability of each score given some
-Orion quantification results. This plot shows the predicted probabilities of
-each clinical and pathologist score given the Orion quantification results.
+#### Comparison of Bayesian vs Frequentist predictions
+
+Compare the predicted probabilities from both approaches to see how similar they are.
+
+```{r, fig.width = 16, fig.height = 8, dpi = 200}
+# Prepare Bayesian predictions for comparison
+bayesian_comparison <- post_draws %>%
+  mutate(
+    score_category = factor(as.character(.category), levels = score_order, ordered = TRUE),
+    model_type = "Bayesian"
+  ) %>%
+  select(source, marker, log_expression, score_category, probability = .epred, model_type)
+
+# Prepare frequentist predictions for comparison
+frequentist_comparison <- clmm_predictions %>%
+  mutate(model_type = "Frequentist") %>%
+  select(source, marker, log_expression, score_category, probability, model_type)
+
+# Combine both for comparison
+model_comparison <- bind_rows(bayesian_comparison, frequentist_comparison)
+
+p <- model_comparison %>%
+  ggplot(
+    aes(
+      x = log_expression,
+      y = probability,
+      color = score_category,
+      linetype = model_type
+    )
+  ) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
+  facet_grid(
+    source ~ marker,
+    scales = "free_x"
+  ) +
+  scale_linetype_manual(values = c("Bayesian" = "solid", "Frequentist" = "dashed")) +
+  labs(
+    x = "log10(expression)",
+    y = "Predicted probability",
+    color = "Score",
+    linetype = "Model type",
+    title = "Comparison: Bayesian vs Frequentist predicted probabilities",
+    subtitle = "Solid lines = Bayesian, Dashed lines = Frequentist"
+  ) +
+  theme(legend.position = "bottom")
+
+p
+
+ggsave(
+  file.path(fig_dir, "bayesian_vs_frequentist_comparison.pdf"),
+  p, width = 22, height = 8
+)
+```
 
 ### Bayesian model with score as predictor
 
