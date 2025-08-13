@@ -1,0 +1,678 @@
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(readxl)
+library(here)
+library(tximport)
+library(qs)
+library(powerjoin)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data", .cache = TRUE)
+
+wd <- here("2025-08 dge-nf-core-validation")
+```
+
+
+```{r wrangling_funcs}
+barcode_well_map <- syn("syn12979100") %>%
+  read_xlsx(sheet = "barcodes_trugrade_384_set1")
+  # rename(Barcode = barcode, Well = well, Plate_ID = plate_id)
+
+prepare_barcode_counts <- function(barcode_count_file) {
+  read_tsv(barcode_count_file, col_names = c("barcode", "count")) %>%
+    mutate(
+      barcode = str_replace(barcode, "^.*([ATCG]{6})$", "\\1")
+    ) %>%
+    left_join(
+      barcode_well_map, by = "barcode"
+    )
+}
+
+prepare_col_meta <- function(colmeta_file, barcode_map) {
+  read_csv(colmeta_file, col_names = "barcode") %>%
+    mutate(
+      barcode = if (all(str_detect(barcode, fixed(":")))) str_split(barcode, fixed(":"), simplify = TRUE)[, 2] else barcode,
+      col_idx = 1:n()
+    ) %>%
+    left_join(
+      barcode_map %>%
+        select(barcode, well),
+      by = "barcode"
+    )
+}
+
+prepare_row_meta <- function(rowmeta_file) {
+  read_csv(rowmeta_file, col_names = "ensembl_gene_id") %>%
+    mutate(row_idx = 1:n())
+}
+
+prepare_mtx_sparse <- function(mtx_file) {
+  read_delim(
+    mtx_file,
+    delim = " ",
+    skip = 3,
+    col_names = c("row_idx", "col_idx", "count"),
+    col_types = "iii"
+  )
+}
+
+
+prepare_counts <- function(mtx, col_meta, row_meta) {
+  # browser()
+  mtx %>%
+    left_join(col_meta, by = "col_idx") %>%
+    left_join(row_meta, by = "row_idx") %>%
+    select(well, ensembl_gene_id, count)
+}
+```
+
+
+
+```{r}
+# For well_384 -> source_96
+old_meta <- syn("syn51716406") %>%
+  read_csv() %>%
+  mutate(
+    well_384 = if_else(
+      str_length(well_384) == 2,
+      paste0(str_sub(well_384, 1, 1), "0", str_sub(well_384, 2, 2)),
+      well_384
+    )
+  )
+
+meta <- syn("syn63553775") %>%
+  read_csv() %>%
+  inner_join(
+    old_meta %>%
+      select(well_384, source_96),
+    by = c("well" = "well_384")
+  )
+
+old_dupes <- syn("syn63549037") %>%
+  prepare_mtx_sparse()
+
+old_counts <- syn("syn63549051") %>%
+  prepare_mtx_sparse()
+
+old_colnames <- syn("syn63549043") %>%
+  prepare_col_meta(barcode_well_map)
+
+old_rownames <- syn("syn63549046") %>%
+  prepare_row_meta()
+```
+
+
+```{r}
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.114.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-114/gtf/homo_sapiens/Homo_sapiens.GRCh38.114.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+gtf_raw <- rtracklayer::import(ensembl_gtf_file) %>%
+  as_tibble()
+
+gtf_protein_coding <- gtf_raw %>%
+  filter(type == "gene", gene_biotype == "protein_coding")
+
+gene_id_symbol_map <- gtf_protein_coding %>%
+  distinct(
+    gene_id,
+    gene_name
+  ) %>%
+  mutate(
+    gene_name = coalesce(gene_name, gene_id)
+  )
+```
+
+
+```{r}
+old_counts_long <- prepare_counts(old_counts, old_colnames, old_rownames)
+
+```
+
+The quant command exposes a number of different resolution strategies. Note: If you are providing a three-column transcript-to-gene map, and hence quantifying in Unspliced/Spliced/Ambiguous (USA) mode, then only the cr-like and cr-like-em resolution modes are currently available. The different UMI resolution strategies are:
+
+    cr-like : This strategy is like the one adopted in cell-ranger, except that it does not first collapse 1-edit-distance UMIs. Within each cell barcode, a list of (gene, UMI, count) tuples is created. If a read maps to more than one gene, then it generates more than one such tuple. The tuples are then sorted lexicographically (first by gene id, then by UMI, and then by count). Any UMI that aligns to only a single gene is assigned to that gene. UMIs that align to more than one gene are assigned to the gene with the highest count for this UMI. If there is a tie for the highest count gene for this UMI, then the corresponding reads are simply discarded.
+
+    cr-like-em : This strategy is like cr-like, except that when a UMI has genes to which it matches with equal frequency, rather than discard the UMIs, the genes are treated as an equivalence class, and the counts for each gene are determined via an expectation maximization algorithm.
+
+    parsimony-em/full : This implements the algorithm described in the alevin paper. Briefly, it builds a graph among the set of reads that align to an overlapping set of transcripts and that have similar (within an edit distance of 1) UMIs. It then attempts to find a parsimonious cover for this graph using the fewest number of possible transcripts. If a unique parsimonious cover is found, then the (deduplicated) reads are assigned directly to the genes that yield the most parsimonious cover. If multiple equally-parsimonious covers exist, then the reads are considered multi-mapping at the gene level and they are probabilistically resolved using an expectation maximization (EM) algorithm.
+
+    parsimony : This strategy is the same as “full”, except that it does not probabilistically resolve reads that remain as gene-multimapping after applying the parsimony criterion. Instead, reads that do not have a unique most-parsimonious assignment are discarded.
+
+    parsimony-gene : This strategy is the same as parsimony above, except that mappings of UMIs to transcripts are projected to their corresponding gene before the relevant graph (Parsimonious UMI Graph) is constructed. Thus, the vertices of the graph consist of sets of gene labels rather than sets of transcript labels. This method may be less precise than the parsimony method (i.e. may wrongly group together UMIs that arise from different transcripts within the same gene), but it simultaneously likely to be more robust to misannotation or incomplete annotation (e.g. incomplete UTR annotation).
+
+    parsimony-gene-em : This strategy is the same as parsimony-above above, except that, like parsimony-em any graphs that exhibit a multi-gene cover will have the multimapping resolved probabilistically with an EM algorithm..
+
+    trivial : This strategy does not search for 1 edit-distance neighbors of UMIs. Instead, it first discards any reads that multi-map at the gene level. The reads that remain then all map uniquely to a single gene. These reads are deduplicated by (exact) UMI, and the number of distinct UMIs mapping to each gene are taken as that gene’s count in the current cell. Note: This resolution strategy is not available in USA mode.
+
+
+```{r}
+new_anndata <- syn("syn68804456") %>%
+# new_anndata <- file.path("2025-08 dge-nf-core-validation", "chromatin_modifiers_raw_matrix.h5ad") %>%
+  read_h5ad()
+
+new_seurat <- syn("syn68804522") %>%
+# new_seurat <- file.path("2025-08 dge-nf-core-validation", "chromatin_modifiers_raw_matrix.seurat.rds") %>%
+  read_rds()
+
+new_seurat2 <- syn("syn68820271") %>%
+  read_rds()
+
+new_seurat3 <- syn("syn68821722") %>%
+  read_rds()
+```
+
+
+```{r}
+overlapping_gene_ids <- intersect(old_rownames$ensembl_gene_id, Features(new_seurat))
+
+new_seurat_long <- list(
+  `new_cr-like` = new_seurat,
+  `new_parsimony-em` = new_seurat2,
+  `new_parsimony-em-gene` = new_seurat3
+) %>%
+  map(
+    \(x) {
+      x[["RNA"]]$counts %>%
+        as.matrix() %>%
+        as_tibble(rownames = "ensembl_gene_id")
+    }
+  ) %>%
+  bind_rows(.id = "method") %>%
+  pivot_longer(
+    cols = -c(method, ensembl_gene_id),
+    names_to = "barcode",
+    values_to = "count"
+  ) %>%
+  left_join(
+    old_colnames %>%
+      select(barcode, well),
+    by = "barcode"
+  )
+```
+
+
+```{r}
+both_counts_long <- bind_rows(
+  old_counts_long %>%
+    filter(ensembl_gene_id %in% overlapping_gene_ids) %>%
+    mutate(method = "old"),
+  new_seurat_long %>%
+    filter(ensembl_gene_id %in% overlapping_gene_ids)
+) %>%
+  complete(
+    ensembl_gene_id, well, method, fill = list(count = 0)
+  )
+
+both_counts <- both_counts_long %>%
+  pivot_wider(
+    names_from = method,
+    values_from = count,
+    values_fill = 0
+  )
+
+gene_ids_pass_threshold <- both_counts_long %>%
+  group_by(ensembl_gene_id, method) %>%
+  filter(
+    sum(count > 5) >= 3
+  ) %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+gtf_protein_coding_pass <- gtf_protein_coding %>%
+  filter(gene_id %in% gene_ids_pass_threshold)
+
+both_counts %>%
+  group_by(well) %>%
+  summarize(
+    across(c(old, starts_with("new")), sum, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    `ratio_cr-like` = `new_cr-like` / old,
+    `ratio_parsimony-em` = `new_parsimony-em` / old,
+    `ratio_parsimony-em-gene` = `new_parsimony-em-gene` / old
+  ) %>%
+  View()
+```
+
+```{r}
+both_counts_total <- both_counts %>%
+  group_by(well) %>%
+  summarize(
+    across(c(old, starts_with("new")), sum, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  semi_join(
+    meta %>%
+      select(well, agent),
+    by = "well"
+  )
+
+both_counts_total %>% pivot_longer(
+    cols = -well,
+    names_to = "method",
+    values_to = "count"
+) %>%
+  ggplot(
+    aes(
+      x = well,
+      y = count,
+      fill = method
+    )
+  ) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  theme_minimal()
+
+p <- both_counts_total %>%
+  ggplot(
+    aes(
+      x = old,
+      y = `new_cr-like`
+    )
+  ) +
+  geom_point(alpha = .4, shape = 16) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_abline(slope = 1, intercept = 0, color = "red")
+
+ggsave(
+  file.path(wd, "both_counts_total_cr-like.pdf"),
+  plot = p,
+  width = 5,
+  height = 4
+)
+
+p <- both_counts_total %>%
+  ggplot(
+    aes(
+      x = old,
+      y = `new_parsimony-em`
+    )
+  ) +
+  geom_point(alpha = .4, shape = 16) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10()
+
+ggsave(
+  file.path(wd, "both_counts_total_parsimony-em.pdf"),
+  plot = p,
+  width = 5,
+  height = 4
+)
+
+```
+
+
+```{r}
+
+
+library(DESeq2)
+library(furrr)
+
+both_counts_mats <- both_counts_long %>%
+  mutate(
+    across(count, round)
+  ) %>%
+  group_nest(
+    method, .key = "mat"
+  ) %>%
+  mutate(
+    mat = map(
+      mat,
+      \(x) {
+        # browser()
+        pivot_wider(
+          select(x, well, ensembl_gene_id, count),
+          names_from = well,
+          values_from = count,
+          values_fill = 0
+        ) %>%
+          column_to_rownames("ensembl_gene_id") %>%
+          as.matrix() %>%
+          {.[gtf_protein_coding_pass$gene_id, meta$well]}
+      }
+    )
+  )
+
+plan(multicore(workers = 4))
+both_counts_deseq <- both_counts_mats %>%
+  mutate(
+    dds = future_map(
+      mat,
+      \(x) DESeqDataSetFromMatrix(
+        countData = x,
+        colData = meta %>%
+          column_to_rownames("well"),
+        design = ~agent + source_96
+      ) %>%
+        DESeq()
+    )
+  )
+
+qsave(
+  both_counts_deseq,
+  file = file.path(wd, "both_counts_deseq.qs")
+)
+```
+
+
+```{r}
+compound_names_mangled <- resultsNames(both_counts_deseq$dds[[1]]) %>%
+  setdiff("Intercept") %>%
+  str_remove("^agent_") %>%
+  str_remove("_vs_....JQ1") %>%
+  magrittr::extract(!str_detect(., "source_96")) %>%
+  setdiff("DMSO")
+
+extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
+  if (missing(contrast)) {
+    res <- rlang::exec(results, de, name = name, !!!res_args)
+  } else {
+    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  }
+  if (!"type" %in% names(shrink_args)) {
+    shrink_args$type <- "ashr"
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+
+res_deseq_raw <- both_counts_deseq %>%
+  mutate(
+    res = future_map(
+      dds,
+      \(x) map(
+        set_names(compound_names_mangled),
+        \(y) extract_deseq_result(x, contrast = c("agent", y, "DMSO"))
+      )
+    )
+  )
+
+
+res_deseq_long <- res_deseq_raw %>%
+  select(method, res) %>%
+  unnest_longer(res, indices_to = "compound_mangled", values_to = "res") %>%
+  unnest(res) %>%
+  power_left_join(
+    gene_id_symbol_map,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res_deseq_long,
+  file.path(wd, "deseq_results.csv.gz")
+)
+```
+
+
+
+```{r}
+res_deseq_wide <- res_deseq_long %>%
+  select(-baseMean) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = c(log2FoldChange, log2FoldChange_MLE, lfcSE, lfcSE_MLE, pvalue, padj)
+  )
+
+
+p <- res_deseq_wide %>%
+  filter(
+    compound_mangled == "Ruxolitinib"
+  ) %>%
+  ggplot(aes(x = log2FoldChange_old, y = `log2FoldChange_new_cr-like`)) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  geom_point(alpha = 0.1) +
+  theme_minimal()
+p
+
+res_deseq_wide %>%
+  filter(
+    compound_mangled == "Ruxolitinib"
+  ) %>%
+  cor.test(
+    ~ log2FoldChange_old + `log2FoldChange_new_cr-like`,
+    data = .,
+    method = "pearson"
+  )
+
+p <- res_deseq_wide %>%
+  filter(
+    compound_mangled == "Ruxolitinib"
+  ) %>%
+  ggplot(aes(x = log2FoldChange_old, y = `log2FoldChange_new_parsimony-em`)) +
+  geom_point(alpha = 0.4, shape = 16) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  theme_minimal()
+p
+
+ggsave(
+  file.path(wd, "deseq_lfc_comparison_ruxolitinib.pdf"),
+  p,
+  width = 6, height = 5
+)
+```
+
+investigate example gene
+
+```{r}
+res_deseq_wide %>%
+  filter(
+    compound_mangled == "Ruxolitinib",
+    abs(log2FoldChange_old) < .5,
+    abs(`log2FoldChange_new_parsimony-em-gene`) > 2
+  ) %>%
+  View()
+
+p <- both_counts_long %>%
+  filter(
+    ensembl_gene_id == "ENSG00000244731"
+  ) %>%
+  inner_join(
+    meta %>%
+      filter(agent %in% c("DMSO", "Ruxolitinib")) %>%
+      select(well, agent),
+    by = "well"
+  ) %>%
+  ggplot(
+    aes(
+      x = agent,
+      y = count
+    )
+  ) +
+  ggbeeswarm::geom_quasirandom() +
+  facet_wrap(~method, scales = "free_y")
+p
+
+res_deseq_wide %>%
+  filter(
+    compound_mangled == "Ruxolitinib"
+  ) %>%
+  cor.test(
+    ~ log2FoldChange_old + `log2FoldChange_new_cr-like`,
+    data = .,
+    method = "pearson"
+  )
+```
+
+
+```{r}
+res_deseq_pca <- res_deseq_long %>%
+  group_nest(method) %>%
+  mutate(
+    pca = map(
+      data,
+      \(x) {
+        # browser()
+        x %>%
+          filter(
+            gene_id %in% {
+              x %>%
+                group_by(gene_id) %>%
+                filter(
+                  sum(padj < 0.05, na.rm = TRUE) > 0
+                ) %>%
+                pull(gene_id)
+            }
+          ) %>%
+          select(compound_mangled, gene_id, log2FoldChange) %>%
+          pivot_wider(
+            names_from = compound_mangled,
+            values_from = log2FoldChange,
+            values_fill = 0
+          ) %>%
+          column_to_rownames("gene_id") %>%
+          as.matrix() %>%
+          t() %>%
+          prcomp(scale. = TRUE)
+      }
+    ),
+    pca_x = map(
+      pca,
+      \(x) {
+        x$x %>%
+          as_tibble(rownames = "compound_mangled")
+      }
+    )
+  )
+
+compute_point_density <- function(df, x_col, y_col, ...) {
+  x <- df[[x_col]]
+  y <- df[[y_col]]
+
+  # Use more robust bandwidth estimation
+  bw_x <- diff(quantile(x, c(0.25, 0.75))) / 1.34 * 2
+  bw_y <- diff(quantile(y, c(0.25, 0.75))) / 1.34 * 2
+
+
+  # Compute the 2D kernel density
+  kde <- MASS::kde2d(
+    x, y,
+    h = c(bw_x, bw_y),
+    lims = c(
+      range(x) + c(-1, 1) * bw_x,
+      range(y) + c(-1, 1) * bw_y
+    ),
+    ...
+  )
+
+  # Find density at each point by interpolation
+  point_density <- fields::interp.surface(
+    obj = list(x = kde$x, y = kde$y, z = kde$z),
+    loc = cbind(x, y)
+  )
+
+  df %>%
+    mutate(.density = point_density)
+}
+
+deseq_pca_x <- res_deseq_pca %>%
+  select(method, pca_x) %>%
+  unnest(pca_x) %>%
+  group_by(method) %>%
+  group_modify(
+    \(x, method) {
+      compute_point_density(x, "PC1", "PC2")
+    }
+  ) %>%
+  ungroup()
+
+library(plotly)
+library(ggrepel)
+p <- deseq_pca_x %>%
+  ggplot(aes(x = PC1, y = PC2, color = compound_mangled)) +
+  geom_point() +
+  geom_text_repel(
+    aes(label = compound_mangled),
+    data = \(x) mutate(x, compound_mangled = if_else(.density < .0002, compound_mangled, "")),
+    max.overlaps = Inf
+  ) +
+  facet_wrap(~method, scales = "free") +
+  scale_color_discrete(guide = "none") +
+  theme_minimal() +
+  labs(
+    x = "PC1",
+    y = "PC2"
+  )
+p
+ggplotly(p)
+
+ggsave(
+  file.path(wd, "deseq_lfc_pca.pdf"),
+  p,
+  width = 10, height = 8
+)
+```
+
+
+```{r}
+deseq_pca_x_vs <- deseq_pca_x %>%
+  select(-.density) %>%
+  group_by(method) %>%
+  mutate(
+    across(starts_with("PC"), \(x) scale(x, center = TRUE, scale = TRUE)[, 1])
+  ) %>%
+  ungroup()
+
+p <- deseq_pca_x_vs %>%
+  filter(
+    method %in% c("old", "new_parsimony-em")
+  ) %>%
+  ggplot(
+    aes(
+      x = PC1, y = PC2,
+      color = compound_mangled,
+      shape = method
+    )
+  ) +
+  geom_point() +
+  geom_line(
+    aes(group = compound_mangled),
+    alpha = 0.5,
+    linetype = "dotted"
+  ) +
+  geom_text_repel(
+    aes(label = compound_mangled),
+    data = \(x) mutate(
+      x,
+      compound_mangled = if_else(
+        compound_mangled %in% {
+          deseq_pca_x %>%
+            filter(
+              .density < .0002,
+              method == "new_parsimony-em"
+            ) %>%
+          pull(compound_mangled)
+        } & method == "new_parsimony-em",
+        compound_mangled, ""
+      )
+    ),
+    max.overlaps = Inf
+  ) +
+  scale_color_discrete(guide = "none")
+
+ggsave(
+  file.path(wd, "deseq_lfc_pca_vs.pdf"),
+  p,
+  width = 8, height = 7
+)
+```
