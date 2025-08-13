@@ -1,0 +1,12 @@
+{
+    "input": "samplesheet.csv",
+    "outdir": "results",
+    "protocol": "1{b[6]u[10]x:}2{r:}",
+    "fasta": "\/home\/ch305\/annotation\/hsap\/GRCh38.114\/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz",
+    "gtf": "\/home\/ch305\/annotation\/hsap\/GRCh38.114\/Homo_sapiens.GRCh38.114.gtf.gz",
+    "simpleaf_index": "\/home\/ch305\/scratch\/annotation\/simpleaf_index\/index",
+    "simpleaf_umi_resolution": "parsimony-em",
+    "save_reference": true,
+    "save_align_intermeds": true,
+    "barcode_whitelist": "dge_barcodes.txt"
+}

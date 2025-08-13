@@ -1,0 +1,114 @@
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(readxl)
+library(powerjoin)
+# library(anndata)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data", .cache = TRUE)
+
+wd <- here("2025-08 CD-melanoma-longterm-dge")
+```
+
+
+```{r wrangling_funcs}
+barcode_well_map <- syn("syn12979100") %>%
+  read_xlsx(sheet = "barcodes_trugrade_384_set1")
+  # rename(Barcode = barcode, Well = well, Plate_ID = plate_id)
+```
+
+
+
+```{r}
+# For well_384 -> source_96
+old_meta <- syn("syn51716406") %>%
+  read_csv() %>%
+  mutate(
+    well_384 = if_else(
+      str_length(well_384) == 2,
+      paste0(str_sub(well_384, 1, 1), "0", str_sub(well_384, 2, 2)),
+      well_384
+    )
+  )
+
+meta <- syn("syn68804475") %>%
+  read_csv() %>%
+  power_left_join(
+    mutate(
+      barcode_well_map,
+      well_384 = str_remove(well, "0(?=\\d$)")
+    ),
+    by = "well_384",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+raw_seurat <- syn("syn68879476") %>%
+  read_rds()
+```
+
+
+```{r}
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.114.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-114/gtf/homo_sapiens/Homo_sapiens.GRCh38.114.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+gtf_raw <- rtracklayer::import(ensembl_gtf_file) %>%
+  as_tibble()
+
+gene_meta <- gtf_raw %>%
+  distinct(
+    gene_id,
+    gene_biotype,
+    gene_symbol = gene_name
+  ) %>%
+  mutate(
+    gene_name = coalesce(gene_symbol, gene_id)
+  )
+```
+
+Add sample and gene metadata to `raw_seurat`
+
+```{r}
+counts_df <- raw_seurat[["RNA"]]$counts %>%
+  as.matrix() %>%
+  as_tibble(rownames = "gene_id") %>%
+  rename_with(
+    \(x) with(barcode_well_map,set_names(well, barcode))[x],
+    .cols = -gene_id
+  ) %>%
+  power_left_join(
+    gene_meta,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  select(gene_id, gene_biotype, gene_symbol, gene_name, everything())
+
+
+write_csv(
+  counts_df,
+  file.path(wd, "	melanoma_longterm_raw_matrix.csv.gz")
+)
+```
+
+
+```{r}
+synStoreMany(
+  file.path(wd, "	melanoma_longterm_raw_matrix.csv.gz"),
+  parentId = "syn68804476",
+  forceVersion = FALSE
+)
+
+```

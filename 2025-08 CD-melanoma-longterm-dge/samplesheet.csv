@@ -1,0 +1,2 @@
+sample,fastq_1,fastq_2
+melanoma_longterm,fastq/CD2_S1_L001_R1_001.fastq.gz,fastq/CD2_S1_L001_R2_001.fastq.gz
