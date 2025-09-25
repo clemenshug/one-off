@@ -1,0 +1,175 @@
+---
+title: "JY Pathology scores"
+author: "Clemens Hug"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup}
+library(tidyverse)
+library(DT)
+library(googlesheets4)
+library(powerjoin)
+library(janitor)
+library(qs)
+library(ggbeeswarm)
+library(here)
+library(fgsea)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+```
+
+## Loading data
+
+```{r}
+patho_scores_raw <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1eATs2B_xOC9rx1VN9dDIbHpNp9iPk6Q7hrkl8zfP9Dk/edit?gid=0#gid=0"
+) %>%
+  drop_na(`LSP ID`) %>%
+  rename(
+    Albumin = `Albumin (tubule)`
+  )
+
+orion_quants_and_clinical_raw <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1a1nLyFQNTJYoVWLX9JS2wIItvTqnxLVJ30NXdnLd7AE/edit?gid=382231029#gid=382231029",
+  sheet = 1
+)
+
+diagnosis_raw <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1GLE_FFPOROKKij08Pxl5ipKuSp3pdQAIqOrJ_ad8MlQ/edit?gid=1315829101#gid=1315829101",
+  sheet = "Diagnosis_Readable"
+)
+
+clinical_scores_raw <- orion_quants_and_clinical_raw %>%
+  select(
+    `LSP ID` = slideName,
+    ends_with("_score")
+  ) %>%
+  rename_with(\(x) str_remove(x, fixed("_score"))) %>%
+  rename(
+    `Lambda LC` = Lambda,
+    `Kappa LC` = Kappa
+  )
+
+orion_quants_raw <- orion_quants_and_clinical_raw %>%
+  transmute(
+    `LSP ID` = slideName,
+    caseID = as.character(caseID),
+    across(starts_with("mean_"))
+  ) %>%
+  rename_with(\(x) str_remove(x, fixed("mean_"))) %>%
+  rename(
+    `Lambda LC` = Lambda,
+    `Kappa LC` = Kappa
+  )
+```
+
+```{r dt-setup}
+dt_options <- list(
+  dom = "Bfrtip",
+  buttons = "copy"
+)
+
+dt_format_signif <- function(dt) {
+  formatSignif(
+    dt,
+    keep(dt$x$data, is.numeric) %>% names(),
+    digits = 2
+  )
+}
+
+dt_default_table <- function(df) {
+  datatable(
+    df,
+    extensions = "Buttons",
+    options = dt_options
+  ) %>%
+    dt_format_signif()
+}
+```
+
+
+## Data processing
+
+```{r}
+diagnosis <- diagnosis_raw %>%
+  pivot_longer(
+    -`Case ID`,
+    names_to = "diagnosis",
+    values_to = "value"
+  ) %>%
+  filter(value == 1) %>%
+  select(-value)
+
+diagnosis_lsp_id <- diagnosis %>%
+  filter(
+    `Case ID` != "E23-1562"
+  ) %>%
+  power_inner_join(
+    orion_quants_raw %>%
+      select(`LSP ID`, caseID),
+    by = c("Case ID" = "caseID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+```
+
+## Compute ratios
+
+```{r}
+kl_ratios <- orion_quants_raw %>%
+  filter(
+    caseID != "E23-1562"
+  ) %>%
+  transmute(
+    `LSP ID`, caseID,
+    across(ends_with("LC")),
+    `KL ratio` = log2(`Kappa LC`) - log2(`Lambda LC`)
+  )
+```
+
+## KL ratio patient set enrichment test
+
+```{r}
+kl_vector <- with(
+  kl_ratios,
+  set_names(`KL ratio`, `LSP ID`)
+)
+
+patient_sets <- with(
+  diagnosis_lsp_id,
+  split(`LSP ID`, diagnosis)
+)
+
+fgsea_res <- fgseaMultilevel(
+  patient_sets,
+  kl_vector
+  # scoreType = "pos"
+)
+```
+
+```{r echo=FALSE}
+dt_default_table(select(fgsea_res, -leadingEdge))
+```
+
+
+```{r fig.width=10, fig.height=6}
+p <- plotGseaTable(
+  patient_sets,
+  kl_vector,
+  fgsea_res
+)
+p
+```

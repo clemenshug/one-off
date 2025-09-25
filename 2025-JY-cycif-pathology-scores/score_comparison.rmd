@@ -426,22 +426,23 @@ p <- orion_vs_scores_all %>%
   ggplot(
     aes(
       x = score,
-      y = log_expression,
-      color = sample_in
+      y = log2(10^log_expression),
+      color = fct_rev(source)
     )
   ) +
   geom_quasirandom(
     orientation = "x",
     shape = 16,
     width = .3,
-    alpha = 0.6
+    alpha = 0.6,
+    # color = paletteer::paletteer_d("ggsci::category10_d3")[2]
   ) +
   geom_boxplot(
     aes(color = NULL),
     outliers = FALSE,
     fill = NA_character_
   ) +
-  paletteer::scale_color_paletteer_d("ggsci::category10_d3") +
+  paletteer::scale_color_paletteer_d("ggsci::category10_d3", guide = "none") +
   ggh4x::facet_grid2(
     vars(source), vars(marker),
     scales = "free_y", independent = "y", axes = "all"
@@ -452,14 +453,14 @@ p <- orion_vs_scores_all %>%
   ) +
   labs(
     x = "Score",
-    y = "log10(expression)",
+    y = "log2(expression)",
     color = "Sample in"
   )
 p
 
 ggsave(
   file.path(fig_dir, "orion_vs_scores_boxplot.pdf"),
-  p, width = 16, height = 6
+  p, width = 14, height = 4
 )
 ```
 
@@ -916,7 +917,7 @@ p <- post_draws %>%
   mutate(across(.category, ordered)) %>%
   ggplot(
     aes(
-      x = log_expression,
+      x = log2(10^log_expression),
       y = .epred,
       color = .category
     )
@@ -948,7 +949,7 @@ p <- post_draws %>%
     expand = FALSE
   ) +
   labs(
-    x = "log10(expression)",
+    x = "log2(expression)",
     y = "Probability",
     title = "Predicted scores from Orion quants",
     fill = "Score",
@@ -959,7 +960,7 @@ p
 
 ggsave(
   file.path(fig_dir, "score_pred_model_probability_curves.pdf"),
-  p, width = 30, height = 6
+  p, width = 20, height = 5
 )
 ```
 
@@ -973,7 +974,7 @@ p <- post_draws %>%
   mutate(across(.category, ordered)) %>%
   ggplot(
     aes(
-      x = log_expression,
+      x = log2(10) * log_expression,
       y = .epred,
       color = .category
     )
@@ -999,7 +1000,7 @@ p <- post_draws %>%
     expand = FALSE
   ) +
   labs(
-    x = "log10(expression)",
+    x = "log2(expression)",
     y = "Probability",
     title = "Predicted scores from Orion quants",
     fill = "Score",
@@ -1010,7 +1011,7 @@ p
 
 ggsave(
   file.path(fig_dir, "score_pred_model_probability_curves_stacked.pdf"),
-  p, width = 30, height = 6
+  p, width = 20, height = 5
 )
 ```
 
