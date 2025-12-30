@@ -1,0 +1,334 @@
+---
+title: "Chromatin modifier DRIAD run plots"
+author: "Clemens Hug"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+library(plotly)
+library(ggrepel)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Load data
+
+```{r}
+compound_and_background_res <- syn("syn63917038") %>%
+  read_csv(col_types = cols(name = col_character()))
+
+compound_res_sig <- syn("syn64695142") %>%
+  read_csv()
+```
+
+```{r}
+compound_and_background_res_long <- bind_rows(
+  compound_and_background_res %>%
+    filter(gs_type == "compound"),
+  compound_and_background_res %>%
+    filter(gs_type == "compound") %>%
+    select(name, gene_set_size) %>%
+    power_inner_join(
+      compound_and_background_res %>%
+        filter(gs_type == "background") %>%
+        select(-name),
+      by = "gene_set_size",
+      check = check_specs(
+        unmatched_keys_left = "warn"
+      )
+    )
+)
+
+```
+
+
+## Compute p-values
+
+```{r}
+compound_res_p_values <- compound_and_background_res %>%
+  filter(
+    gs_type == "compound"
+  ) %>%
+  nest_join(
+    compound_and_background_res %>%
+      filter(gs_type == "background"),
+    by = c("brain_region", "classification", "class", "comparison", "gene_set_size"),
+    name = "background_res"
+  ) %>%
+  mutate(
+    n_background = map_int(background_res, nrow),
+    pval = map2_dbl(AUC, background_res, \(x, y) {
+      (sum(x < y$AUC) + 1) / nrow(y)
+    })
+  )
+```
+
+```{r}
+plot_dir <- file.path("driad_plots", "chromatin_modifiers")
+plots <- compound_and_background_res_long %>%
+  group_nest(
+    classification, comparison
+  ) %>%
+  nest_join(
+    compound_res_p_values,
+    by = c("classification", "comparison"),
+    name = "p_values"
+  ) %>%
+  mutate(
+    plot = map2(
+      data, p_values,
+      function(d, pvals) {
+        d %>%
+          ggplot(
+            aes(AUC)
+          ) +
+          geom_rect(
+            aes(
+              fill = pval < 0.05
+            ),
+            xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, alpha = 0.1,
+            data = pvals
+          ) +
+          scale_fill_manual(
+            values = c("TRUE" = "red", "FALSE" = "white"),
+            guide = "none"
+          ) +
+          geom_density(
+            data = ~.x %>%
+              filter(gs_type == "background")
+          ) +
+          geom_vline(
+            aes(xintercept = AUC),
+            color = "red",
+            data = ~.x %>%
+              filter(gs_type == "compound")
+          ) +
+          geom_text(
+            aes(label = signif(pval, 2)),
+            x = -Inf, y = Inf,
+            hjust = 0, vjust = 1,
+            data = pvals
+          ) +
+          facet_wrap(
+            vars(name, class)
+          ) +
+          theme_bw() +
+          theme(
+            strip.background = element_rect(color = "black", fill = "white")
+          )
+      }
+    )
+  )
+
+dir.create(plot_dir, showWarnings = FALSE)
+pwalk(
+  plots,
+  function(classification, comparison, plot, ...) {
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("auc_", classification, "_", comparison, ".pdf")
+      ),
+      plot, width = 14, height = 12
+    )
+  }
+)
+
+
+p <- compound_res_plotting %>%
+  filter(classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled") %>%
+  group_by(name) %>%
+  mutate(
+    name_experiment = if (length(unique(experiment)) > 1) paste0(name, " replicate ", experiment) else name
+  ) %>%
+  ungroup() %>%
+  mutate(
+    name_experiment = factor(name_experiment, levels = sort(unique(name_experiment)))
+  ) %>%
+  ggplot(
+    aes(AUC)
+  ) +
+  geom_density(
+    data = ~.x %>%
+      filter(str_starts(gs_id, "background"))
+  ) +
+  geom_vline(
+    aes(xintercept = AUC),
+    data = ~.x %>%
+      filter(str_starts(gs_id, "compound"))
+  ) +
+  facet_grid(vars(name_experiment), vars(class))
+
+ggsave(
+  "driad_plots/pcc_high_pooled_densities.pdf", p, width = 8, height = 12
+)
+
+compound_res_p_values <- compound_res_plotting %>%
+  mutate(
+    type = if_else(str_starts(gs_id, "compound"), "compound", "background"),
+  ) %>%
+  group_by(brain_region, classification, class, comparison, id, name) %>%
+  summarize(
+    n_drug = sum(type == "compound"),
+    pval = (sum(AUC[type == "compound"] < AUC[type == "background"]) + 1) / n(),
+    .groups = "drop"
+  )
+
+write_csv(
+  compound_res_p_values,
+  "driad/compound_res_p_values.csv.gz"
+)
+
+compound_res_p_values_comparison <- compound_res_p_values %>%
+  select(brain_region, classification, comparison, class, experiment, drug, name, target_name, pval) %>%
+  mutate(across(pval, ~-log10(.x))) %>%
+  pivot_wider(names_from = class, values_from = pval)
+
+p <- compound_res_p_values_comparison %>%
+  ggplot(aes(negative, positive)) +
+    geom_point() +
+    facet_grid(vars(brain_region), vars(classification, comparison)) +
+    coord_equal()
+
+ggsave(
+  "driad_plots/pvalues_positive_vs_negative.pdf", p, width = 12, height = 12
+)
+
+library(ggridges)
+ggplot(diamonds, aes(x = price, y = cut)) +
+  geom_density_ridges(scale = 4) +
+  scale_y_discrete(expand = c(0, 0)) +     # will generally have to set the `expand` option
+  scale_x_continuous(expand = c(0, 0)) +   # for both axes to remove unneeded padding
+  coord_cartesian(clip = "off") + # to avoid clipping of the very top of the top ridgeline
+  theme_ridges()
+
+p <- compound_res_plotting %>%
+  filter(classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled") %>%
+  group_by(name) %>%
+  mutate(
+    name_experiment = if (length(unique(experiment)) > 1) paste0(name, " replicate ", experiment) else name
+  ) %>%
+  ungroup() %>%
+  mutate(
+    name_experiment = factor(name_experiment, levels = sort(unique(name_experiment))) %>%
+      fct_rev()
+  ) %>%
+  ggplot(
+    aes(AUC, name_experiment)
+  ) +
+  geom_density_ridges2(
+    data = ~.x %>%
+      filter(str_starts(gs_id, "background")),
+    alpha = 0.8
+  ) +
+  geom_segment(
+    aes(x = AUC, xend = AUC, y = as.numeric(name_experiment), yend = as.numeric(name_experiment) + 0.9),
+    data = ~.x %>%
+      filter(str_starts(gs_id, "compound")),
+    color = "firebrick1"
+  ) +
+  geom_text(
+    aes(x = 0.2, y = as.numeric(name_experiment) + 0.7, label = label),
+    data = compound_res_p_values %>%
+      filter(classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled") %>%
+      group_by(name) %>%
+      mutate(
+        name_experiment = if (length(unique(experiment)) > 1) paste0(name, " replicate ", experiment) else name
+      ) %>%
+      ungroup() %>%
+      mutate(
+        name_experiment = factor(name_experiment, levels = sort(unique(name_experiment))) %>%
+          fct_rev()
+      ) %>%
+      mutate(
+        label = paste0("p=", signif(pval, 2))
+      ),
+    inherit.aes = FALSE, hjust = 0, vjust = 0.5
+  ) +
+  facet_wrap(vars(class), ncol = 2) +
+  theme_minimal() +
+  labs(y = "")
+
+ggsave(
+  "driad_plots/pcc_high_pooled_ridges.pdf", p, width = 5, height = 4
+)
+
+
+p <- compound_res_plotting %>%
+  group_by(name) %>%
+  mutate(
+    name_experiment = if (length(unique(experiment)) > 1) paste0(name, " replicate ", experiment) else name
+  ) %>%
+  ungroup() %>%
+  filter(
+    name %in% c(
+      "Baricitinib", "Ruxolitinib", "NVP-TAE684", "Tofacitinib"
+    ),
+    !str_detect(name_experiment, "replicate 2"),
+    classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled"
+  ) %>%
+  mutate(name_experiment = str_replace(name_experiment, " replicate 1", "")) %>%
+  mutate(
+    name_experiment = factor(name_experiment, levels = sort(unique(name_experiment))) %>%
+      fct_rev()
+  ) %>%
+  ggplot(
+    aes(AUC, name_experiment)
+  ) +
+  geom_density_ridges2(
+    data = ~.x %>%
+      filter(str_starts(gs_id, "background")),
+    alpha = 0.8
+  ) +
+  geom_segment(
+    aes(x = AUC, xend = AUC, y = as.numeric(name_experiment), yend = as.numeric(name_experiment) + 0.9),
+    data = ~.x %>%
+      filter(str_starts(gs_id, "compound")),
+    color = "firebrick1"
+  ) +
+  geom_text(
+    aes(x = 0.2, y = as.numeric(name_experiment) + 0.7, label = label),
+    data = compound_res_p_values %>%
+      filter(classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled") %>%
+      group_by(name) %>%
+      mutate(
+        name_experiment = if (length(unique(experiment)) > 1) paste0(name, " replicate ", experiment) else name
+      ) %>%
+      ungroup() %>%
+      filter(
+        name %in% c(
+          "Baricitinib", "Ruxolitinib", "NVP-TAE684", "Tofacitinib"
+        ),
+        !str_detect(name_experiment, "replicate 2"),
+        classification == "high_threshold", brain_region == "PCC", comparison == "all_pooled"
+      ) %>%
+      mutate(name_experiment = str_replace(name_experiment, " replicate 1", "")) %>%
+      mutate(
+        name_experiment = factor(name_experiment, levels = sort(unique(name_experiment))) %>%
+          fct_rev()
+      ) %>%
+      mutate(
+        label = paste0("p=", signif(pval, 2))
+      ),
+    inherit.aes = FALSE, hjust = 0, vjust = 0.5
+  ) +
+  facet_wrap(vars(class), ncol = 2) +
+  theme_minimal() +
+  labs(y = "") +
+  theme(axis.text.y = element_text(hjust = 1, vjust = 0))
+
+ggsave(
+  "driad_plots/pcc_high_pooled_ridges_small.pdf", p, width = 5, height = 2
+)
+
+```
