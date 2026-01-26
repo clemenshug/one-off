@@ -464,6 +464,35 @@ ggsave(
 )
 ```
 
+### JT tests
+
+Here we are testing whether there is a significant monotonic relationship between
+the pathologist's scores and the Orion quantification using the
+(https://en.wikipedia.org/wiki/Jonckheere%27s_trend_test)[Jonckheere-Terpstra test].
+
+```{r}
+jt_results <- orion_vs_scores_all %>%
+  drop_na(score) %>%
+  group_by(source, marker) %>%
+  summarize(
+    res = list(
+      DescTools::JonckheereTerpstraTest(
+        log_expression,
+        score,
+        alternative = "increasing",
+        exact = FALSE
+      ) %>%
+        tidy()
+    ),
+    .groups = "drop"
+  ) %>%
+  unnest(res)
+
+dt_default_table(
+  jt_results
+)
+```
+
 ### Confusion matrix plot
 
 Confusion matrix of the scores from the pathologist and the clinical report
@@ -772,6 +801,9 @@ performs better, i.e. whether the Orion quants are better at predicting the
 pathologist's scores or the clinical report's scores.
 
 ```{r}
+orion_vs_scores_model_input <- orion_vs_scores_all %>%
+  group_nest(source, marker)
+
 mod1 <- brm(
   score ~ log_expression + (1 | lsp_id),
   data = orion_vs_scores_model_input$data[[4]],
@@ -854,9 +886,6 @@ fit_model <- function(data) {
   )
 }
 
-orion_vs_scores_model_input <- orion_vs_scores_all %>%
-  group_nest(source, marker)
-
 if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
   mod1 <- fit_model(orion_vs_scores_model_input$data[[1]]) %>%
     add_criterion("loo", moment_match = TRUE)
@@ -896,7 +925,7 @@ post_draws <- orion_vs_scores_models %>%
       epred_draws(
         mod,
         newdata = tibble(
-          log_expression = seq(min(data$log_expression), max(data$log_expression), length.out = 10)
+          log_expression = seq(quantile(data$log_expression, c(0.025, 0.975)), length.out = 20)
         ),
         re_formula = NA
       )
