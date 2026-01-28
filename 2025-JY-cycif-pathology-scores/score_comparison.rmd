@@ -886,7 +886,7 @@ fit_model <- function(data) {
   )
 }
 
-if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
+if (!file.exists(here("2025-JY-cycif-pathology-scores", "orion_vs_scores_model_loos.qs"))) {
   mod1 <- fit_model(orion_vs_scores_model_input$data[[1]]) %>%
     add_criterion("loo", moment_match = TRUE)
 
@@ -910,10 +910,10 @@ if (!file.exists(here("orion_vs_scores_model_loos.qs"))) {
 
   qsave(
     orion_vs_scores_models,
-    here("orion_vs_scores_model_loos.qs")
+    here("2025-JY-cycif-pathology-scores", "orion_vs_scores_model_loos.qs")
   )
 } else {
-  orion_vs_scores_models <- qread(here("orion_vs_scores_model_loos.qs"))
+  orion_vs_scores_models <- qread(here("2025-JY-cycif-pathology-scores", "orion_vs_scores_model_loos.qs"))
 }
 ```
 
