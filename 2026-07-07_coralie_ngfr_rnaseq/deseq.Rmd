@@ -1,0 +1,370 @@
+---
+title: "NGFR+ RNA-seq"
+author: "Clemens Hug"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup}
+library(conflicted)
+library(tidyverse)
+library(powerjoin)
+library(here)
+library(synExtra)
+library(DESeq2)
+library(readxl)
+library(ggrastr)
+library(ggrepel)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::count,
+  generics::setdiff,
+  dplyr::slice,
+  dplyr::rename,
+  purrr::reduce
+)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+
+plot_dir <- here(
+  "2026-07-07_coralie_ngfr_rnaseq", "plots"
+)
+dir.create(
+  plot_dir, showWarnings = FALSE, recursive = TRUE
+)
+```
+
+## Loading data
+
+```{r}
+counts_raw <- syn("syn76375618") |>
+  read_tsv()
+
+gene_meta <- counts_raw |>
+  distinct(gene_id, gene_name, gene_biotype)
+
+meta_raw <- syn("syn76375613") |>
+  read_excel(
+    sheet = "Priority",
+    skip = 1
+  )
+```
+
+```{r}
+counts_long <- counts_raw |>
+  pivot_longer(
+    cols = -c(gene_id, gene_name, gene_biotype),
+    names_to = c("library_id", "sample_id", "count_type"),
+    names_pattern = "^([^_]+)_([0-9]+)_(cpm|count)$",
+    values_to = "count"
+  )
+
+count_mat <- counts_long |>
+  filter(
+    count_type == "count"
+  ) |>
+  select(gene_id, sample_id, count) |>
+  pivot_wider(
+    names_from = sample_id,
+    values_from = count
+  ) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+genes_eligible <- rownames(count_mat)[rowSums(count_mat > 3) > 3] |>
+  str_subset("^ENSG")
+```
+
+
+## Count transformation
+
+Have to use only letters in condition names, otherwise DESeq2 complains
+
+```{r}
+deseq_meta <- meta_raw |>
+  filter(Sample %in% counts_long$sample_id) |>
+  mutate(
+    NGFRstatus = case_when(
+      Group == "Acute" ~ "all",
+      NGFRstatus == "NGFR+" ~ "NGFRpos",
+      NGFRstatus == "NGFR-" ~ "NGFRneg",
+      TRUE ~ NA
+    ),
+    condition = paste(
+      Cell_line, Group, NGFRstatus, Treatment, sep = "_"
+    )
+  )
+
+deseq_all <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, as.character(deseq_meta$Sample)] |>
+    round(),
+  colData = deseq_meta,
+  design = ~ 1
+) |>
+  estimateSizeFactors() |>
+  estimateDispersions()
+
+counts_all <- bind_rows(
+  raw = counts(deseq_all, normalized = FALSE) |>
+    as_tibble(rownames = "gene_id"),
+  norm = counts(deseq_all, normalized = TRUE) |>
+    as_tibble(rownames = "gene_id"),
+  vst = vst(deseq_all, blind = TRUE) |>
+    assay() |>
+    as_tibble(rownames = "gene_id"),
+  .id = "count_type"
+)
+```
+
+## PCA
+
+```{r}
+vst_mat <- counts_all |>
+  filter(count_type == "vst") |>
+  select(-count_type) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+pca_raw <- prcomp(t(vst_mat), scale. = FALSE, center = TRUE)
+
+pca_x <- as_tibble(pca_raw$x, rownames = "sample_id_unique") |>
+  power_inner_join(
+    meta,
+    by = c("sample_id_unique"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+pca_x_long <- as_tibble(pca_raw$x, rownames = "Sample") |>
+  pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "component",
+    values_to = "value"
+  )
+
+pca_sd <- broom::tidy(pca_raw, "eigenvalues")
+
+pc_sd_map <- with(
+  pca_sd,
+  set_names(percent, paste0("PC", PC))
+)
+```
+
+
+```{r}
+pca_x_vs <- combn(paste0("PC", seq_len(5)), 2) |>
+  t() |>
+  magrittr::set_colnames(paste0("component_", seq_len(2))) |>
+  as_tibble() |>
+  power_inner_join(
+    pca_x_long,
+    by = c("component_1" = "component"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) |>
+  power_inner_join(
+    pca_x_long,
+    by = c("component_2" = "component", "Sample"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_1", "_2")
+  ) |>
+  power_inner_join(
+    deseq_meta |>
+      mutate(
+        across(Sample, as.character),
+        across(
+          Group,
+          \(x) factor(x, levels = c("Acute", "SingleClone", "FACS"))
+        ),
+        across(
+          NGFRstatus,
+          \(x) factor(x, levels = c("-", "NGFR-", "NGFR+"))
+        )
+      ),
+    by = c("Sample"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+p <- ggplot(
+  pca_x_vs,
+  aes(
+    x = value_1,
+    y = value_2,
+    color = fct_cross(Group, NGFRstatus, sep = " | "),
+    shape = Cell_line,
+    size = Treatment
+  )
+) +
+  geom_point(alpha = 0.8) +
+  scale_size_manual(
+    values = c("DMSO" = 1, "Vemurafenib" = 2)
+  ) +
+  scale_color_manual(
+    values = c(
+      "Acute | -" = "#444444",
+      "SingleClone | NGFR-" = "#9ECAE1",
+      "SingleClone | NGFR+" = "#2171B5",
+      "FACS | NGFR-" = "#FCAE91",
+      "FACS | NGFR+" = "#CB181D"
+    ),
+    name = "Group"
+  ) +
+  facet_wrap(
+    ~paste0(component_1, " (", signif(pc_sd_map[component_1] * 100, 2), "%) vs ", component_2, " (", signif(pc_sd_map[component_2] * 100, 2), "%)"),
+    scales = "free"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  envalysis::theme_publish() +
+  theme(
+    legend.box = "vertical",
+    strip.clip = "off"
+  )
+p
+
+ggsave(
+  file.path(
+    plot_dir, "pca_vst_all_samples.pdf"
+  ),
+  p, width = 8, height = 8
+)
+```
+
+
+## Differential expression
+
+```{r}
+extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
+  if (missing(contrast)) {
+    res <- rlang::exec(results, de, name = name, !!!res_args)
+  } else {
+    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  }
+  if (!"type" %in% names(shrink_args)) {
+    shrink_args$type <- "ashr"
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
+  shrunken |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(
+      res |>
+        as_tibble(rownames = "gene_id") |>
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+```
+
+```{r}
+deseq_meta |> count(condition)
+
+de_contrasts <- tribble(
+  ~contrast_name, ~condition_numerator, ~condition_denominator,
+  "Acute A375 Vemurafenib vs DMSO", "A375_Acute_all_Vemurafenib", "A375_Acute_all_DMSO",
+  "FACS A375 NGFR+ vs NGFR-", "A375_FACS_NGFRpos_Vemurafenib", "A375_FACS_NGFRneg_Vemurafenib"
+)
+
+deseq_de <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, as.character(deseq_meta$Sample)] |>
+    round(),
+  colData = deseq_meta,
+  design = ~ condition
+) |>
+  DESeq()
+
+deseq_res <- de_contrasts |>
+  mutate(
+    res = map2(
+      condition_numerator,
+      condition_denominator,
+      \(num, den) {
+        extract_deseq_result(
+          deseq_de,
+          contrast = c("condition", num, den)
+        )
+      }
+    )
+  ) |>
+  unnest(res) |>
+  power_left_join(
+    gene_meta,
+    by = c("gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  select(starts_with("condition"), starts_with("gene"), everything()) |>
+  mutate(
+    gene_label = coalesce(gene_name, gene_id)
+  )
+```
+
+
+```{r}
+p <- ggplot(
+  deseq_res,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj)
+  )
+) +
+  rasterize(
+    geom_point(
+      aes(
+        color = padj < .05
+      ),
+      shape = 16,
+      alpha = .5
+    ), dpi = 300, device = "ragg_png"
+  ) +
+  geom_text_repel(
+    aes(
+      label = gene_label
+    ),
+    size = 3,
+    max.overlaps = Inf,
+    data = \(df) group_by(df, contrast_name, log2FoldChange > 0) |>
+      arrange(padj, pvalue) |>
+      slice_head(n = 10)
+  ) +
+  scale_color_manual(
+    values = c(`FALSE` = "black", `TRUE` = "red")
+  ) +
+  facet_wrap(
+    ~contrast_name,
+    scales = "free"
+  )
+
+ggsave(
+  file.path(
+    plot_dir, "de_volcanos.pdf"
+  ),
+  p, width = 8, height = 5
+)
+```
