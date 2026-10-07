@@ -964,6 +964,298 @@ ggsave(
 )
 ```
 
+## NGFR+ vs NGFR- across cell lines
+
+FACS sorted NGFR+ and NGFR- Vemurafenib d14 samples are available for A375,
+COLO858 and WM115 (2 sort replicates each, WM989 only NGFR-). Use batch 1
+only
+
+```{r}
+meta_b1 <- deseq_meta |>
+  filter(sequencing_batch == "batch_1")
+
+deseq_b1 <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, meta_b1$sample_uid] |>
+    round(),
+  colData = meta_b1 |>
+    column_to_rownames("sample_uid"),
+  design = ~ 0 + condition
+) |>
+  DESeq()
+
+resultsNames(deseq_b1)
+```
+
+Per cell line contrasts, the A375 SingleClone d14 contrast as reference and the
+mean NGFR+ effect across the three cell lines.
+
+```{r}
+ngfr_cell_lines <- c("A375", "COLO858", "WM115")
+coefs_ngfr_pos <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRpos_Vemurafenib_d14")
+coefs_ngfr_neg <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRneg_Vemurafenib_d14")
+coef_sc_pos <- "conditionA375_SingleClone_NGFRpos_Vemurafenib_d14"
+coef_sc_neg <- "conditionA375_SingleClone_NGFRneg_Vemurafenib_d14"
+
+stopifnot(
+  all(c(coefs_ngfr_pos, coefs_ngfr_neg, coef_sc_pos, coef_sc_neg) %in% resultsNames(deseq_b1))
+)
+
+de_contrasts_b1 <- bind_rows(
+  tibble(
+    contrast_id = ngfr_cell_lines,
+    contrast_name = paste("NGFR+ vs NGFR- |", ngfr_cell_lines),
+    contrast = map2(coefs_ngfr_pos, coefs_ngfr_neg, list),
+    res_args = list(list())
+  ),
+  tribble(
+    ~contrast_id, ~contrast_name, ~contrast, ~res_args,
+    "A375_SingleClone", "NGFR+ vs NGFR- | A375 SingleClone", list(coef_sc_pos, coef_sc_neg), list(),
+    "mean", "NGFR+ vs NGFR- | mean A375, COLO858, WM115", list(coefs_ngfr_pos, coefs_ngfr_neg), list(listValues = c(1 / 3, -1 / 3))
+  )
+)
+
+deseq_res_b1 <- de_contrasts_b1 |>
+  mutate(
+    res = map2(
+      contrast, res_args,
+      \(contrast, res_args) extract_deseq_result(
+        deseq_b1,
+        contrast = contrast,
+        res_args = res_args
+      )
+    )
+  ) |>
+  select(contrast_id, contrast_name, res) |>
+  unnest(res) |>
+  power_left_join(
+    gene_meta,
+    by = c("gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    contrast_name = fct_inorder(contrast_name),
+    gene_label = coalesce(gene_name, gene_id)
+  )
+```
+
+The per cell line fold changes should agree with the model of all samples.
+
+```{r}
+deseq_res_b1 |>
+  filter(contrast_id %in% ngfr_cell_lines) |>
+  inner_join(
+    deseq_res |>
+      filter(str_detect(contrast_name, "^FACS \\S+ NGFR\\+ vs NGFR- Vemurafenib d14$")) |>
+      transmute(
+        contrast_id = str_extract(contrast_name, "^FACS (\\S+)", group = 1),
+        gene_id, log2FoldChange, padj
+      ),
+    by = c("contrast_id", "gene_id"), suffix = c("_b1", "_all")
+  ) |>
+  group_by(contrast_id) |>
+  summarise(
+    lfc_cor = cor(log2FoldChange_b1, log2FoldChange_all, use = "complete.obs"),
+    n_sig_b1 = sum(padj_b1 < .05, na.rm = TRUE),
+    n_sig_all = sum(padj_all < .05, na.rm = TRUE)
+  )
+```
+
+Genes with a shared NGFR+ signature across all three cell lines, i.e. changed
+in the same direction in each (intersection-union test, maximum of the three
+p-values). Pretty conservative.
+
+```{r}
+ngfr_shared_cell_lines <- deseq_res_b1 |>
+  filter(contrast_id %in% ngfr_cell_lines) |>
+  group_by(gene_id, gene_label) |>
+  summarize(
+    log2FoldChange_min = sign(log2FoldChange[1]) * min(abs(log2FoldChange)),
+    same_direction = n_distinct(sign(log2FoldChange)) == 1,
+    n_lines_sig = sum(coalesce(padj, 1) < .05),
+    pvalue = if_else(same_direction, max(pvalue), 1),
+    .groups = "drop"
+  ) |>
+  mutate(
+    padj = p.adjust(pvalue, method = "BH")
+  ) |>
+  arrange(padj)
+
+ngfr_shared_cell_lines
+
+bind_rows(
+  deseq_res_b1 |>
+    mutate(across(contrast_name, as.character)),
+  ngfr_shared_cell_lines |>
+    mutate(contrast_name = "NGFR+ vs NGFR- | shared A375, COLO858, WM115")
+) |>
+  group_by(contrast_name) |>
+  summarise(
+    n_sig = sum(padj < .05, na.rm = TRUE),
+    n_up = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) > 0, na.rm = TRUE),
+    n_down = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) < 0, na.rm = TRUE)
+  )
+```
+
+Overlap of the per cell line significant genes and correlation of the fold
+changes between cell lines.
+
+```{r}
+deseq_res_b1 |>
+  filter(contrast_id %in% ngfr_cell_lines, padj < .05) |>
+  group_by(gene_id) |>
+  summarise(
+    n_lines = n(),
+    direction = case_when(
+      all(log2FoldChange > 0) ~ "up",
+      all(log2FoldChange < 0) ~ "down",
+      TRUE ~ "mixed"
+    )
+  ) |>
+  count(n_lines, direction)
+
+deseq_res_b1 |>
+  filter(contrast_id %in% ngfr_cell_lines) |>
+  select(contrast_id, gene_id, log2FoldChange) |>
+  pivot_wider(names_from = contrast_id, values_from = log2FoldChange) |>
+  select(-gene_id) |>
+  cor(use = "pairwise.complete.obs")
+```
+
+```{r}
+p <- combn(paste("NGFR+ vs NGFR- |", ngfr_cell_lines), 2) |>
+  t() |>
+  magrittr::set_colnames(c("x_contrast", "y_contrast")) |>
+  as_tibble() |>
+  pmap(
+    \(x_contrast, y_contrast) plot_lfc_scatter(
+      deseq_res_b1 |>
+        mutate(across(contrast_name, as.character)),
+      x_contrast, y_contrast
+    )
+  ) |>
+  patchwork::wrap_plots(ncol = 3, guides = "collect")
+
+ggsave(
+  file.path(
+    plot_dir, "de_lfc_comparisons_cell_lines.pdf"
+  ),
+  p, width = 20, height = 7
+)
+```
+
+
+```{r}
+ngfr_shared_top <- ngfr_shared_cell_lines |>
+  filter(
+    same_direction,
+    padj < .05
+  ) |>
+  group_by(direction = sign(log2FoldChange_min)) |>
+  slice_min(padj, n = 30, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(log2FoldChange_min)
+
+ngfr_heatmap_columns <- c(
+  "NGFR+ vs NGFR- | A375" = "A375 d14",
+  "NGFR+ vs NGFR- | COLO858" = "COLO858 d14",
+  "NGFR+ vs NGFR- | WM115" = "WM115 d14",
+  "NGFR+ vs NGFR- | mean A375, COLO858, WM115" = "Mean d14",
+  "NGFR+ vs NGFR- | A375 SingleClone" = "A375 SingleClone d14",
+  "NGFR+ vs NGFR- | Vemurafenib" = "A375 d7 (batch 2)"
+)
+
+p <- bind_rows(
+  deseq_res_b1 |>
+    mutate(across(contrast_name, as.character)),
+  deseq_res_b2 |>
+    mutate(across(contrast_name, as.character))
+) |>
+  filter(
+    contrast_name %in% names(ngfr_heatmap_columns),
+    gene_id %in% ngfr_shared_top$gene_id
+  ) |>
+  mutate(
+    column = factor(
+      ngfr_heatmap_columns[contrast_name],
+      levels = ngfr_heatmap_columns
+    ),
+    gene_id = factor(gene_id, levels = ngfr_shared_top$gene_id)
+  ) |>
+  ggplot(aes(column, gene_id, fill = log2FoldChange)) +
+  geom_tile() +
+  geom_text(
+    aes(label = if_else(coalesce(padj, 1) < .05, "*", "")),
+    vjust = 0.75
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    limits = c(-4, 4), oob = scales::squish,
+    name = "log2FC\nNGFR+ vs NGFR-"
+  ) +
+  scale_y_discrete(
+    labels = with(ngfr_shared_top, set_names(gene_label, gene_id))
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+p
+
+ggsave(
+  file.path(
+    plot_dir, "ngfr_shared_cell_lines_lfc.pdf"
+  ),
+  p, width = 6, height = 12
+)
+```
+
+```{r}
+p <- ngfr_shared_cell_lines |>
+  filter(same_direction) |>
+  group_by(sign(log2FoldChange_min)) |>
+  slice_min(padj, n = 3, with_ties = FALSE) |>
+  pull(gene_id) |>
+  plot_gene_expression()
+
+ggsave(
+  file.path(
+    plot_dir, "gene_expression_ngfr_shared_cell_lines.pdf"
+  ),
+  p, width = 12, height = 16
+)
+```
+
+```{r}
+deseq_res_b1 |>
+  select(contrast_id, gene_id, gene_label, log2FoldChange, padj) |>
+  pivot_wider(
+    names_from = contrast_id,
+    values_from = c(log2FoldChange, padj)
+  ) |>
+  power_left_join(
+    ngfr_shared_cell_lines |>
+      select(
+        gene_id, same_direction, n_lines_sig, log2FoldChange_min,
+        pvalue_shared = pvalue, padj_shared = padj
+      ),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  arrange(padj_shared) |>
+  write_csv(
+    file.path(
+      plot_dir, "de_results_ngfr_shared_cell_lines.csv.gz"
+    )
+  )
+```
+
 ## NGFR- Vemurafenib vs DMSO beyond the acute drug response
 
 The d7 contrast NGFR- Vemurafenib vs NGFR- DMSO mixes the direct
