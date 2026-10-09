@@ -57,7 +57,7 @@ dir.create(
 Sample numbers restart in each sequencing run, so samples are identified by
 `sample_uid` = `<sequencing_batch>_<Sample>`.
 
-```{r}
+```{r load-data}
 counts_raw <- c(
   "batch_1" = "syn76375618",
   "batch_2" = "syn77628475"
@@ -104,7 +104,7 @@ Some library prep batch 1 samples were sequenced again in batch 2
 (`Sample_batch1` gives the sample number in batch 1). These technical
 replicate pairs are used by RUVs to estimate the sequencing batch effect.
 
-```{r}
+```{r technical-replicates}
 reseq_pairs <- meta_raw |>
   filter(sequencing_batch == "batch_2", !is.na(Sample_batch1)) |>
   transmute(
@@ -116,16 +116,17 @@ reseq_pairs <- meta_raw |>
 reseq_pairs
 ```
 
-```{r}
+```{r count-matrix}
 counts_long <- counts_raw |>
   map(
-    \(x) pivot_longer(
-      x,
-      cols = -c(gene_id, gene_name, gene_biotype),
-      names_to = c("library_id", "sample_id", "count_type"),
-      names_pattern = "^([^_]+)_([0-9]+)_(cpm|count)$",
-      values_to = "count"
-    )
+    \(x) x |>
+      select(gene_id, ends_with("_count")) |>
+      pivot_longer(
+        -gene_id,
+        names_to = c("library_id", "sample_id"),
+        names_pattern = "^([^_]+)_([0-9]+)_count$",
+        values_to = "count"
+      )
   ) |>
   bind_rows(.id = "sequencing_batch") |>
   mutate(
@@ -133,9 +134,6 @@ counts_long <- counts_raw |>
   )
 
 count_mat <- counts_long |>
-  filter(
-    count_type == "count"
-  ) |>
   select(gene_id, sample_uid, count) |>
   pivot_wider(
     names_from = sample_uid,
@@ -149,12 +147,9 @@ genes_eligible <- rownames(count_mat)[rowSums(count_mat > 3) > 3] |>
   str_subset("^ENSG")
 ```
 
+## Prepare sample metadata and normalization
 
-## Count transformation
-
-Have to use only letters in condition names, otherwise DESeq2 complains
-
-```{r}
+```{r prepare-normalization}
 deseq_meta <- meta_raw |>
   filter(sample_uid %in% colnames(count_mat)) |>
   left_join(
@@ -169,14 +164,7 @@ deseq_meta <- meta_raw |>
     merged_id = coalesce(pair_id, sample_uid)
   )
 
-write_csv(
-  deseq_meta,
-  file.path(
-    plot_dir, "deseq_meta.csv"
-  )
-)
-
-deseq_all <- DESeqDataSetFromMatrix(
+deseq_norm <- DESeqDataSetFromMatrix(
   countData = count_mat[genes_eligible, deseq_meta$sample_uid] |>
     round(),
   colData = deseq_meta |>
@@ -193,8 +181,8 @@ RUVs estimates the unwanted variation factor `W_1` from the differences within
 each technical replicate pair (same library, two sequencing runs). All genes are
 used as negative controls (seems ok based on RUVseq vignette)
 
-```{r}
-ruv_input <- counts(deseq_all, normalized = TRUE) |>
+```{r estimate-ruv}
+ruv_input <- counts(deseq_norm, normalized = TRUE) |>
   round()
 
 # Each row is one replicate set, columns are column indices into ruv_input
@@ -213,14 +201,19 @@ ruv_res <- RUVs(
   isLog = FALSE
 )
 
-deseq_all$W_1 <- ruv_res$W[, "W_1"]
+deseq_norm$W_1 <- ruv_res$W[, "W_1"]
 deseq_meta$W_1 <- ruv_res$W[, "W_1"]
-deseq_meta$size_factor <- sizeFactors(deseq_all)[deseq_meta$sample_uid]
+deseq_meta$size_factor <- sizeFactors(deseq_norm)[deseq_meta$sample_uid]
+
+write_csv(
+  deseq_meta,
+  file.path(plot_dir, "deseq_meta.csv")
+)
 ```
 
 `W_1` should mainly separate the two sequencing runs.
 
-```{r}
+```{r plot-ruv}
 p <- deseq_meta |>
   ggplot(
     aes(x = fct_reorder(sample_uid, W_1), y = W_1, color = sequencing_batch)
@@ -236,15 +229,13 @@ p <- deseq_meta |>
 p
 
 ggsave(
-  file.path(
-    plot_dir, "ruv_w1.pdf"
-  ),
+  file.path(plot_dir, "ruv_w1.pdf"),
   p, width = 8, height = 4
 )
 ```
 
-```{r}
-vst_raw <- vst(deseq_all, blind = TRUE) |>
+```{r transform-counts}
+vst_raw <- vst(deseq_norm, blind = TRUE) |>
   assay()
 
 # Protect the biological signal while regressing out W_1
@@ -253,23 +244,11 @@ vst_ruv <- limma::removeBatchEffect(
   covariates = deseq_meta$W_1,
   design = model.matrix(~ condition, data = deseq_meta)
 )
-
-counts_all <- bind_rows(
-  raw = counts(deseq_all, normalized = FALSE) |>
-    as_tibble(rownames = "gene_id"),
-  norm = counts(deseq_all, normalized = TRUE) |>
-    as_tibble(rownames = "gene_id"),
-  vst = vst_raw |>
-    as_tibble(rownames = "gene_id"),
-  vst_ruv = vst_ruv |>
-    as_tibble(rownames = "gene_id"),
-  .id = "count_type"
-)
 ```
 
 ## PCA
 
-```{r}
+```{r compute-pca}
 pca_condition_colors <- c(
   "Acute | unsorted | DMSO" = "#c8c5c5",
   "Acute | unsorted | Vemurafenib" = "#444444",
@@ -322,60 +301,42 @@ pcas <- list(
 ) |>
   map(\(x) prcomp(t(x), scale. = FALSE, center = TRUE))
 
-pca_x_long <- pcas |>
+pca_scores <- pcas |>
   map(
-    \(x) as_tibble(x$x, rownames = "sample_uid") |>
-      pivot_longer(
-        cols = starts_with("PC"),
-        names_to = "component",
-        values_to = "value"
+    \(pca) as_tibble(pca$x, rownames = "sample_uid") |>
+      power_inner_join(
+        pca_meta,
+        by = "sample_uid",
+        check = check_specs(
+          unmatched_keys_left = "warn",
+          duplicate_keys_right = "warn"
+        )
       )
-  ) |>
-  bind_rows(.id = "correction")
-
-pc_sd_map <- pcas |>
-  map(
-    \(x) broom::tidy(x, "eigenvalues") |>
-      with(set_names(percent, paste0("PC", PC)))
   )
+
+pc_variance <- pcas |>
+  map(\(pca) set_names(pca$sdev^2 / sum(pca$sdev^2), colnames(pca$x)))
 ```
 
+```{r plot-pca}
+pca_pairs <- combn(paste0("PC", seq_len(5)), 2, simplify = FALSE)
 
-```{r}
-pca_x_vs <- combn(paste0("PC", seq_len(5)), 2) |>
-  t() |>
-  magrittr::set_colnames(paste0("component_", seq_len(2))) |>
-  as_tibble() |>
-  power_inner_join(
-    pca_x_long,
-    by = c("component_1" = "component"),
-    check = check_specs(
-      unmatched_keys_left = "warn"
-    )
-  ) |>
-  power_inner_join(
-    pca_x_long,
-    by = c("component_2" = "component", "sample_uid", "correction"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    ),
-    suffix = c("_1", "_2")
-  ) |>
-  power_inner_join(
-    pca_meta,
-    by = c("sample_uid"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  mutate(
-    facet_label = paste0(
-      component_1, " (", signif(map2_dbl(correction, component_1, \(x, y) pc_sd_map[[x]][[y]]) * 100, 2), "%) vs ",
-      component_2, " (", signif(map2_dbl(correction, component_2, \(x, y) pc_sd_map[[x]][[y]]) * 100, 2), "%)"
-    )
-  )
+make_pca_pairs <- function(scores, variance) {
+  map(pca_pairs, function(pair) {
+    axis_labels <- paste0(pair, " (", signif(variance[pair] * 100, 2), "%)")
+    scores |>
+      mutate(
+        value_1 = .data[[pair[1]]],
+        value_2 = .data[[pair[2]]],
+        facet_label = paste(axis_labels, collapse = " vs ")
+      ) |>
+      select(-matches("^PC[0-9]+$"))
+  }) |>
+    bind_rows()
+}
+
+pca_x_vs <- map2(pca_scores, pc_variance, make_pca_pairs) |>
+  bind_rows(.id = "correction")
 
 pca_plots <- pca_x_vs |>
   group_nest(correction, keep = TRUE) |>
@@ -430,26 +391,20 @@ pca_plots <- pca_x_vs |>
     )
   )
 
-# pca_plots$p
-
 ggplotly(
-  pca_plots$p[[1]],
+  pca_plots$p[[match("ruv", pca_plots$correction)]],
   tooltip = c("text", "condition_pca", "cell_line_batch"),
   width = 1200, height = 1000
 ) |>
   htmlwidgets::saveWidget(
-    file.path(
-      plot_dir, "pca_vst_all_samples_ruv.html"
-    ),
+    file.path(plot_dir, "pca_vst_all_samples_ruv.html"),
     selfcontained = TRUE
   )
 
 pwalk(
   pca_plots,
   \(correction, p, ...) ggsave(
-    file.path(
-      plot_dir, paste0("pca_vst_all_samples_", correction, ".pdf")
-    ),
+    file.path(plot_dir, paste0("pca_vst_all_samples_", correction, ".pdf")),
     p, width = 14, height = 12
   )
 )
@@ -461,7 +416,7 @@ Plot VST expression of one or more genes (Ensembl IDs or gene symbols) across
 all conditions. Sequencing batches are shown in separate panels because their
 expression levels are not directly comparable.
 
-```{r}
+```{r gene-expression}
 plot_gene_expression <- function(genes, expr = vst_raw) {
   gene_ids <- gene_meta |>
     filter(gene_id %in% genes | gene_name %in% genes, gene_id %in% rownames(expr)) |>
@@ -537,27 +492,29 @@ p <- plot_gene_expression(c("NGFR", "SOX10", "MITF"))
 p
 
 ggsave(
-  file.path(
-    plot_dir, "gene_expression_ngfr_sox10_mitf.pdf"
-  ),
+  file.path(plot_dir, "gene_expression_ngfr_sox10_mitf.pdf"),
   p, width = 12, height = 9
 )
 ```
 
 ## Differential expression
 
-```{r}
-extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
-  if (missing(contrast)) {
-    res <- rlang::exec(results, de, name = name, !!!res_args)
-  } else {
-    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
-  }
-  if (!"type" %in% names(shrink_args)) {
-    shrink_args$type <- "ashr"
-  }
-  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
-  shrunken |>
+The four models answer different questions. All use the same eligible genes.
+`deseq_norm` above is used only for normalization, RUV estimation and QC.
+
+| Model | Samples and technical replicates | Design | Purpose |
+|---|---|---|---|
+| `deseq_all_ruv` | Both runs; technical replicates summed, with size-factor-weighted `W_1` | `~ W_1 + condition` | Standalone RUV diagnostics; not used downstream right now |
+| `deseq_b2` | Batch 2, library prep batch 2 | `~ Treatment + inducer:NGFRpos` | Compare inducers, pooling the NGFR+ effect across IFNg doses |
+| `deseq_b1` | Batch 1 only | `~ 0 + condition` | Compare NGFR states across cell lines |
+| `deseq_all` | Both runs; resequenced batch 2 libraries excluded | `~ 0 + condition` | Compare d7 and acute drug responses with shared dispersion estimation |
+
+### Shared analysis helpers
+
+```{r analysis-helpers}
+extract_deseq_result <- function(de, contrast, res_args = list()) {
+  res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  lfcShrink(de, res = res, type = "ashr") |>
     as_tibble(rownames = "gene_id") |>
     left_join(
       res |>
@@ -566,30 +523,106 @@ extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_a
       by = "gene_id", suffix = c("", "_MLE")
     )
 }
+
+run_contrasts <- function(de, contrasts, gene_meta) {
+  contrasts |>
+    mutate(
+      res = map2(
+        contrast, res_args,
+        \(contrast, res_args) extract_deseq_result(de, contrast, res_args)
+      )
+    ) |>
+    select(-contrast, -res_args) |>
+    unnest(res) |>
+    power_left_join(
+      gene_meta,
+      by = "gene_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) |>
+    mutate(gene_label = coalesce(gene_name, gene_id))
+}
+
+summarize_de <- function(res, effect = log2FoldChange) {
+  res |>
+    group_by(contrast_name) |>
+    summarise(
+      n_sig = sum(padj < .05, na.rm = TRUE),
+      n_up = sum(padj < .05 & {{ effect }} > 0, na.rm = TRUE),
+      n_down = sum(padj < .05 & {{ effect }} < 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+shared_signature <- function(res) {
+  res |>
+    group_by(gene_id, gene_label) |>
+    summarize(
+      log2FoldChange_min = sign(log2FoldChange[1]) * min(abs(log2FoldChange)),
+      same_direction = n_distinct(sign(log2FoldChange)) == 1,
+      n_contrasts_sig = sum(coalesce(padj, 1) < .05),
+      pvalue = if_else(same_direction, max(pvalue), 1),
+      .groups = "drop"
+    ) |>
+    mutate(padj = p.adjust(pvalue, method = "BH")) |>
+    arrange(padj)
+}
+
+plot_volcano <- function(res, n_labels = 10) {
+  res |>
+    mutate(contrast_name = fct_inorder(contrast_name)) |>
+    ggplot(aes(log2FoldChange, -log10(padj))) +
+    rasterize(
+      geom_point(aes(color = padj < .05), shape = 16, alpha = .5),
+      dpi = 300, device = "ragg_png"
+    ) +
+    geom_text_repel(
+      aes(label = gene_label),
+      size = 3,
+      max.overlaps = Inf,
+      data = \(df) group_by(df, contrast_name, log2FoldChange > 0) |>
+        arrange(padj, pvalue) |>
+        slice_head(n = n_labels)
+    ) +
+    scale_color_manual(values = c(`FALSE` = "black", `TRUE` = "red")) +
+    facet_wrap(~contrast_name, scales = "free")
+}
 ```
 
-Merging the technical replicates from the two sequencing runs here and
-using the size factor weighted W1 mean for them
+### All samples with RUV adjustment
 
-```{r}
+Merge technical replicates from the two sequencing runs, using their
+size-factor-weighted mean `W_1`. The results below are standalone diagnostics;
+subsequent analyses use `deseq_b1`, `deseq_b2`, or `deseq_all`.
+
+```{r fit-all-ruv}
 deseq_meta |> count(condition)
 
-de_contrasts <- tribble(
-  ~contrast_name, ~condition_numerator, ~condition_denominator,
-  "Acute A375 Vemurafenib vs DMSO", "A375_Acute_unsorted_Vemurafenib_d3", "A375_Acute_unsorted_DMSO_d3",
-  "FACS A375 NGFR+ vs NGFR- Vemurafenib d7", "A375_FACS_NGFRpos_Vemurafenib_d7", "A375_FACS_NGFRneg_Vemurafenib_d7",
-  "FACS A375 NGFR+ vs NGFR- Vemurafenib d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRneg_Vemurafenib_d14",
-  "FACS A375 IFNg 50 NGFR+ vs NGFR-", "A375_FACS_NGFRpos_IFNg_50_d7", "A375_FACS_NGFRneg_IFNg_50_d7",
-  "FACS A375 IFNg 100 NGFR+ vs NGFR-", "A375_FACS_NGFRpos_IFNg_100_d7", "A375_FACS_NGFRneg_IFNg_100_d7",
-  "SingleClone A375 NGFR+ vs NGFR- Vemurafenib d14", "A375_SingleClone_NGFRpos_Vemurafenib_d14", "A375_SingleClone_NGFRneg_Vemurafenib_d14",
-  "FACS COLO858 NGFR+ vs NGFR- Vemurafenib d14", "COLO858_FACS_NGFRpos_Vemurafenib_d14", "COLO858_FACS_NGFRneg_Vemurafenib_d14",
-  "FACS WM115 NGFR+ vs NGFR- Vemurafenib d14", "WM115_FACS_NGFRpos_Vemurafenib_d14", "WM115_FACS_NGFRneg_Vemurafenib_d14",
-  "FACS A375 NGFR- Vemurafenib vs DMSO d7", "A375_FACS_NGFRneg_Vemurafenib_d7", "A375_FACS_NGFRneg_DMSO_d7",
-  "FACS A375 NGFR+ Vemurafenib vs IFNg 50 d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRpos_IFNg_50_d7",
-  "FACS A375 NGFR+ Vemurafenib vs IFNg 100 d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRpos_IFNg_100_d7",
-)
+de_contrasts_all_ruv <- tribble(
+  ~contrast_id, ~contrast_name, ~condition_numerator, ~condition_denominator,
+  "acute", "Acute A375 Vemurafenib vs DMSO", "A375_Acute_unsorted_Vemurafenib_d3", "A375_Acute_unsorted_DMSO_d3",
+  "ngfr_vemu_d7", "FACS A375 NGFR+ vs NGFR- Vemurafenib d7", "A375_FACS_NGFRpos_Vemurafenib_d7", "A375_FACS_NGFRneg_Vemurafenib_d7",
+  "A375", "FACS A375 NGFR+ vs NGFR- Vemurafenib d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRneg_Vemurafenib_d14",
+  "ngfr_ifng_50", "FACS A375 IFNg 50 NGFR+ vs NGFR-", "A375_FACS_NGFRpos_IFNg_50_d7", "A375_FACS_NGFRneg_IFNg_50_d7",
+  "ngfr_ifng_100", "FACS A375 IFNg 100 NGFR+ vs NGFR-", "A375_FACS_NGFRpos_IFNg_100_d7", "A375_FACS_NGFRneg_IFNg_100_d7",
+  "A375_SingleClone", "SingleClone A375 NGFR+ vs NGFR- Vemurafenib d14", "A375_SingleClone_NGFRpos_Vemurafenib_d14", "A375_SingleClone_NGFRneg_Vemurafenib_d14",
+  "COLO858", "FACS COLO858 NGFR+ vs NGFR- Vemurafenib d14", "COLO858_FACS_NGFRpos_Vemurafenib_d14", "COLO858_FACS_NGFRneg_Vemurafenib_d14",
+  "WM115", "FACS WM115 NGFR+ vs NGFR- Vemurafenib d14", "WM115_FACS_NGFRpos_Vemurafenib_d14", "WM115_FACS_NGFRneg_Vemurafenib_d14",
+  "ngfrneg_vemu_dmso", "FACS A375 NGFR- Vemurafenib vs DMSO d7", "A375_FACS_NGFRneg_Vemurafenib_d7", "A375_FACS_NGFRneg_DMSO_d7",
+  "ngfrpos_vemu_ifng50", "FACS A375 NGFR+ Vemurafenib vs IFNg 50 d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRpos_IFNg_50_d7",
+  "ngfrpos_vemu_ifng100", "FACS A375 NGFR+ Vemurafenib vs IFNg 100 d14", "A375_FACS_NGFRpos_Vemurafenib_d14", "A375_FACS_NGFRpos_IFNg_100_d7",
+) |>
+  mutate(
+    contrast = map2(
+      condition_numerator, condition_denominator,
+      \(num, den) c("condition", num, den)
+    ),
+    res_args = list(list())
+  )
 
-deseq_de <- DESeqDataSetFromMatrix(
+deseq_all_ruv <- DESeqDataSetFromMatrix(
   countData = count_mat[genes_eligible, deseq_meta$sample_uid] |>
     round(),
   colData = deseq_meta |>
@@ -606,84 +639,18 @@ deseq_de <- DESeqDataSetFromMatrix(
   ) |>
   DESeq()
 
-deseq_res <- de_contrasts |>
-  mutate(
-    res = map2(
-      condition_numerator,
-      condition_denominator,
-      \(num, den) {
-        extract_deseq_result(
-          deseq_de,
-          contrast = c("condition", num, den)
-        )
-      }
-    )
-  ) |>
-  unnest(res) |>
-  power_left_join(
-    gene_meta,
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  select(starts_with("condition"), starts_with("gene"), everything()) |>
-  mutate(
-    gene_label = coalesce(gene_name, gene_id)
-  )
+deseq_res_all_ruv <- run_contrasts(deseq_all_ruv, de_contrasts_all_ruv, gene_meta)
 ```
 
-
-```{r}
-group_by(deseq_res, contrast_name) |>
-  summarise(
-    n_sig = sum(padj < .05, na.rm = TRUE),
-    n_up = sum(padj < .05 & log2FoldChange > 0, na.rm = TRUE),
-    n_down = sum(padj < .05 & log2FoldChange < 0, na.rm = TRUE)
-  )
+```{r summarize-all-ruv}
+summarize_de(deseq_res_all_ruv)
 ```
 
-
-```{r}
-p <- ggplot(
-  deseq_res,
-  aes(
-    x = log2FoldChange,
-    y = -log10(padj)
-  )
-) +
-  rasterize(
-    geom_point(
-      aes(
-        color = padj < .05
-      ),
-      shape = 16,
-      alpha = .5
-    ), dpi = 300, device = "ragg_png"
-  ) +
-  geom_text_repel(
-    aes(
-      label = gene_label
-    ),
-    size = 3,
-    max.overlaps = Inf,
-    data = \(df) group_by(df, contrast_name, log2FoldChange > 0) |>
-      arrange(padj, pvalue) |>
-      slice_head(n = 10)
-  ) +
-  scale_color_manual(
-    values = c(`FALSE` = "black", `TRUE` = "red")
-  ) +
-  facet_wrap(
-    ~contrast_name,
-    scales = "free"
-  )
+```{r volcano-all-ruv}
+p <- plot_volcano(deseq_res_all_ruv)
 
 ggsave(
-  file.path(
-    plot_dir, "de_volcanos.pdf"
-  ),
+  file.path(plot_dir, "de_volcanos.pdf"),
   p, width = 14, height = 10
 )
 ```
@@ -691,14 +658,14 @@ ggsave(
 ## Inducer comparison within batch 2
 
 All d7 inducer samples (DMSO, Vemurafenib, IFNg, TNFa) are together in batch 2,
-analyzing seperately.
+analyzed separately.
 
-No NGFR+ samples for DMSO and TNFa, so NGFR+ vs NGFR- only for
-estimated for Vemurafenib and IFNg. We use a main effect per treatment
+There are no NGFR+ samples for DMSO and TNFa, so NGFR+ vs NGFR- is
+estimated only for Vemurafenib and IFNg. We use a main effect per treatment
 (describing NGFR- cells) plus an NGFR+ effect per inducer, pooling the two
 IFNg doses because IFNg 50 only has a single replicate.
 
-```{r}
+```{r fit-batch-2}
 meta_b2 <- deseq_meta |>
   filter(sequencing_batch == "batch_2", library_prep_batch == 2) |>
   mutate(
@@ -706,7 +673,6 @@ meta_b2 <- deseq_meta |>
       Treatment,
       levels = c("DMSO", "Vemurafenib", "IFNg_50", "IFNg_100", "TNFa_100")
     ),
-    Replicate = factor(Replicate),
     inducer = str_remove(Treatment, "_[0-9]+$"),
     NGFRpos = as.numeric(NGFRstatus == "NGFRpos")
   )
@@ -715,7 +681,7 @@ meta_b2 |>
   count(Treatment, inducer, NGFRstatus)
 
 design_b2 <- model.matrix(
-  ~ Replicate + Treatment + inducer:NGFRpos,
+  ~ Treatment + inducer:NGFRpos,
   data = meta_b2
 )
 design_b2 <- design_b2[, colSums(design_b2 != 0) > 0]
@@ -739,7 +705,7 @@ Contrasts in terms of the model coefficients. Treatment contrasts describe
 NGFR- cells, NGFR+ states are the treatment coefficient plus the inducer's
 NGFR+ coefficient.
 
-```{r}
+```{r contrasts-batch-2}
 coef_vemu <- "TreatmentVemurafenib"
 coef_ifng_50 <- "TreatmentIFNg_50"
 coef_ifng <- "TreatmentIFNg_100"
@@ -748,152 +714,263 @@ coef_ngfr_vemu <- "inducerVemurafenib_NGFRpos"
 coef_ngfr_ifng <- "inducerIFNg_NGFRpos"
 
 de_contrasts_b2 <- tribble(
-  ~contrast_name, ~contrast, ~res_args,
+  ~contrast_id, ~contrast_name, ~contrast, ~res_args,
   # NGFR+ vs NGFR-
-  "NGFR+ vs NGFR- | Vemurafenib", list(coef_ngfr_vemu), list(),
-  "NGFR+ vs NGFR- | IFNg", list(coef_ngfr_ifng), list(),
-  "NGFR+ vs NGFR- | mean Vemurafenib & IFNg", list(c(coef_ngfr_vemu, coef_ngfr_ifng), character()), list(listValues = c(0.5, -0.5)),
-  "NGFR+ vs NGFR- | IFNg vs Vemurafenib", list(coef_ngfr_ifng, coef_ngfr_vemu), list(),
+  "ngfr_vemu", "NGFR+ vs NGFR- | Vemurafenib", list(coef_ngfr_vemu), list(),
+  "ngfr_ifng", "NGFR+ vs NGFR- | IFNg", list(coef_ngfr_ifng), list(),
+  "ngfr_mean", "NGFR+ vs NGFR- | mean Vemurafenib & IFNg", list(c(coef_ngfr_vemu, coef_ngfr_ifng), character()), list(listValues = c(0.5, -0.5)),
+  "ngfr_ifng_vs_vemu", "NGFR+ vs NGFR- | IFNg vs Vemurafenib", list(coef_ngfr_ifng, coef_ngfr_vemu), list(),
   # Inducers within NGFR-
-  "NGFR- | Vemurafenib vs DMSO", list(coef_vemu), list(),
-  "NGFR- | IFNg 50 vs DMSO", list(coef_ifng_50), list(),
-  "NGFR- | IFNg 100 vs DMSO", list(coef_ifng), list(),
-  "NGFR- | TNFa vs DMSO", list(coef_tnfa), list(),
-  "NGFR- | IFNg 100 vs Vemurafenib", list(coef_ifng, coef_vemu), list(),
-  "NGFR- | TNFa vs Vemurafenib", list(coef_tnfa, coef_vemu), list(),
-  "NGFR- | TNFa vs IFNg 100", list(coef_tnfa, coef_ifng), list(),
+  "neg_vemu_dmso", "NGFR- | Vemurafenib vs DMSO", list(coef_vemu), list(),
+  "neg_ifng50_dmso", "NGFR- | IFNg 50 vs DMSO", list(coef_ifng_50), list(),
+  "neg_ifng100_dmso", "NGFR- | IFNg 100 vs DMSO", list(coef_ifng), list(),
+  "neg_tnfa_dmso", "NGFR- | TNFa vs DMSO", list(coef_tnfa), list(),
+  "neg_ifng100_vemu", "NGFR- | IFNg 100 vs Vemurafenib", list(coef_ifng, coef_vemu), list(),
+  "neg_tnfa_vemu", "NGFR- | TNFa vs Vemurafenib", list(coef_tnfa, coef_vemu), list(),
+  "neg_tnfa_ifng100", "NGFR- | TNFa vs IFNg 100", list(coef_tnfa, coef_ifng), list(),
   # Inducers within NGFR+
-  "NGFR+ | IFNg 100 vs Vemurafenib", list(c(coef_ifng, coef_ngfr_ifng), c(coef_vemu, coef_ngfr_vemu)), list(),
+  "pos_ifng100_vemu", "NGFR+ | IFNg 100 vs Vemurafenib", list(c(coef_ifng, coef_ngfr_ifng), c(coef_vemu, coef_ngfr_vemu)), list(),
   # NGFR+ states vs untreated NGFR- cells
-  "NGFR+ Vemurafenib vs NGFR- DMSO", list(c(coef_vemu, coef_ngfr_vemu)), list(),
-  "NGFR+ IFNg 100 vs NGFR- DMSO", list(c(coef_ifng, coef_ngfr_ifng)), list()
+  "pos_vemu_neg_dmso", "NGFR+ Vemurafenib vs NGFR- DMSO", list(c(coef_vemu, coef_ngfr_vemu)), list(),
+  "pos_ifng100_neg_dmso", "NGFR+ IFNg 100 vs NGFR- DMSO", list(c(coef_ifng, coef_ngfr_ifng)), list()
 )
 
-deseq_res_b2 <- de_contrasts_b2 |>
-  mutate(
-    res = map2(
-      contrast, res_args,
-      \(contrast, res_args) extract_deseq_result(
-        deseq_b2,
-        contrast = contrast,
-        res_args = res_args
-      )
-    )
-  ) |>
-  select(contrast_name, res) |>
-  unnest(res) |>
-  power_left_join(
-    gene_meta,
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  mutate(
-    contrast_name = fct_inorder(contrast_name),
-    gene_label = coalesce(gene_name, gene_id)
-  )
+deseq_res_b2 <- run_contrasts(deseq_b2, de_contrasts_b2, gene_meta)
 ```
 
 Genes with a shared NGFR+ signature, i.e. changed in the same direction in both
 Vemurafenib and IFNg (intersection-union test, maximum of the two p-values).
 
-```{r}
+```{r shared-inducer-signature}
 deseq_res_b2_ngfr_shared <- deseq_res_b2 |>
   filter(
-    contrast_name %in% c("NGFR+ vs NGFR- | Vemurafenib", "NGFR+ vs NGFR- | IFNg")
+    contrast_id %in% c("ngfr_vemu", "ngfr_ifng")
   ) |>
-  group_by(gene_id, gene_label) |>
-  summarize(
-    log2FoldChange_min = sign(log2FoldChange[1]) * min(abs(log2FoldChange)),
-    same_direction = n_distinct(sign(log2FoldChange)) == 1,
-    pvalue = if_else(same_direction, max(pvalue), 1),
-    .groups = "drop"
-  ) |>
-  mutate(
-    padj = p.adjust(pvalue, method = "BH")
-  ) |>
-  arrange(padj)
-
-deseq_res_b2_ngfr_shared
-```
-
-```{r}
-bind_rows(
-  deseq_res_b2,
-  deseq_res_b2_ngfr_shared |>
-    mutate(contrast_name = "NGFR+ vs NGFR- | shared Vemurafenib & IFNg")
-) |>
-  group_by(contrast_name) |>
-  summarise(
-    n_sig = sum(padj < .05, na.rm = TRUE),
-    n_up = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) > 0, na.rm = TRUE),
-    n_down = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) < 0, na.rm = TRUE)
-  )
+  shared_signature() |>
+  select(-n_contrasts_sig)
 
 write_csv(
-  deseq_res_b2,
-  file.path(
-    plot_dir, "de_results_batch_2.csv.gz"
-  )
+  deseq_res_b2_ngfr_shared,
+  file.path(plot_dir, "de_results_batch_2_ngfr_shared.csv.gz")
 )
 ```
 
-```{r}
-p <- ggplot(
+```{r summarize-batch-2}
+bind_rows(
+  summarize_de(deseq_res_b2),
+  deseq_res_b2_ngfr_shared |>
+    mutate(contrast_name = "NGFR+ vs NGFR- | shared Vemurafenib & IFNg") |>
+    summarize_de(effect = log2FoldChange_min)
+)
+
+write_csv(
   deseq_res_b2,
-  aes(
-    x = log2FoldChange,
-    y = -log10(padj)
-  )
-) +
-  rasterize(
-    geom_point(
-      aes(
-        color = padj < .05
-      ),
-      shape = 16,
-      alpha = .5
-    ), dpi = 300, device = "ragg_png"
-  ) +
-  geom_text_repel(
-    aes(
-      label = gene_label
-    ),
-    size = 3,
-    max.overlaps = Inf,
-    data = \(df) group_by(df, contrast_name, log2FoldChange > 0) |>
-      arrange(padj, pvalue) |>
-      slice_head(n = 10)
-  ) +
-  scale_color_manual(
-    values = c(`FALSE` = "black", `TRUE` = "red")
-  ) +
-  facet_wrap(
-    ~contrast_name,
-    scales = "free"
-  )
+  file.path(plot_dir, "de_results_batch_2.csv.gz")
+)
+```
+
+```{r volcano-batch-2}
+p <- plot_volcano(deseq_res_b2)
 
 ggsave(
-  file.path(
-    plot_dir, "de_volcanos_batch_2.pdf"
-  ),
+  file.path(plot_dir, "de_volcanos_batch_2.pdf"),
   p, width = 18, height = 14
 )
 ```
 
+### Design check: pooled IFNg doses for the main effect
+
+Quick comparison of the current design (per dose main effect, pooled IFNg
+NGFR+ effect) against pooling the IFNg doses for the main effect too
+(`~ inducer + inducer:NGFRpos`).
+
+```{r design-comparison-b2}
+meta_b2_alt <- meta_b2 |>
+  mutate(
+    inducer = factor(inducer, levels = c("DMSO", "Vemurafenib", "IFNg", "TNFa"))
+  )
+
+design_b2_alt <- model.matrix(
+  ~ inducer + inducer:NGFRpos,
+  data = meta_b2_alt
+)
+design_b2_alt <- design_b2_alt[, colSums(design_b2_alt != 0) > 0]
+colnames(design_b2_alt) <- colnames(design_b2_alt) |>
+  str_remove_all("[()]") |>
+  str_replace_all(":", "_")
+
+deseq_b2_alt <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, meta_b2_alt$sample_uid] |>
+    round(),
+  colData = meta_b2_alt |>
+    column_to_rownames("sample_uid"),
+  design = design_b2_alt
+) |>
+  DESeq()
+
+resultsNames(deseq_b2_alt)
+
+design_cmp_res <- list(current = deseq_b2, pooled = deseq_b2_alt) |>
+  imap(\(de, design) {
+    c(coef_ngfr_vemu, coef_ngfr_ifng) |>
+      set_names() |>
+      map(\(coef) results(de, name = coef) |> as_tibble(rownames = "gene_id")) |>
+      list_rbind(names_to = "coef") |>
+      mutate(design = design)
+  }) |>
+  list_rbind()
+
+# DE counts per design
+design_cmp_res |>
+  group_by(design, coef) |>
+  summarize(
+    n_sig = sum(padj < .05, na.rm = TRUE),
+    n_up = sum(padj < .05 & log2FoldChange > 0, na.rm = TRUE),
+    n_down = sum(padj < .05 & log2FoldChange < 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+design_cmp_wide <- design_cmp_res |>
+  select(design, coef, gene_id, log2FoldChange, pvalue, padj) |>
+  pivot_wider(names_from = design, values_from = c(log2FoldChange, pvalue, padj)) |>
+  mutate(
+    sig = case_when(
+      padj_current < .05 & padj_pooled < .05 ~ "both",
+      padj_current < .05 ~ "current only",
+      padj_pooled < .05 ~ "pooled only",
+      TRUE ~ "neither"
+    )
+  )
+
+design_cmp_wide |>
+  count(coef, sig) |>
+  pivot_wider(names_from = sig, values_from = n)
+
+design_cmp_wide |>
+  group_by(coef) |>
+  summarize(
+    cor_lfc = cor(log2FoldChange_current, log2FoldChange_pooled, use = "complete.obs"),
+    cor_log_p = cor(-log10(pvalue_current), -log10(pvalue_pooled), use = "complete.obs"),
+    .groups = "drop"
+  )
+
+p <- design_cmp_wide |>
+  ggplot(aes(log2FoldChange_current, log2FoldChange_pooled, color = sig)) +
+  rasterize(
+    geom_point(shape = 16, alpha = .4, size = .8),
+    dpi = 300, device = "ragg_png"
+  ) +
+  geom_abline(linetype = "dashed") +
+  facet_wrap(~coef) +
+  labs(x = "log2FC current design", y = "log2FC pooled IFNg design")
+
+p_p <- design_cmp_wide |>
+  ggplot(aes(-log10(pvalue_current), -log10(pvalue_pooled), color = sig)) +
+  rasterize(
+    geom_point(shape = 16, alpha = .4, size = .8),
+    dpi = 300, device = "ragg_png"
+  ) +
+  geom_abline(linetype = "dashed") +
+  facet_wrap(~coef) +
+  labs(x = "-log10 p current design", y = "-log10 p pooled IFNg design")
+
+# Dispersion differences, expected to be inflated in the pooled design for
+# genes with an IFNg dose effect
+p_disp <- tibble(
+  gene_id = rownames(deseq_b2),
+  disp_current = dispersions(deseq_b2),
+  disp_pooled = dispersions(deseq_b2_alt)
+) |>
+  left_join(
+    results(deseq_b2, contrast = list(coef_ifng, coef_ifng_50)) |>
+      as_tibble(rownames = "gene_id") |>
+      select(gene_id, lfc_ifng_dose = log2FoldChange),
+    by = "gene_id"
+  ) |>
+  ggplot(aes(log2(disp_current), log2(disp_pooled), color = abs(lfc_ifng_dose))) +
+  rasterize(
+    geom_point(shape = 16, alpha = .5, size = .8),
+    dpi = 300, device = "ragg_png"
+  ) +
+  geom_abline(linetype = "dashed") +
+  scale_color_viridis_c(limits = c(0, 2), oob = scales::squish) +
+  labs(color = "|log2FC|\nIFNg 100 vs 50")
+
+ggsave(
+  file.path(plot_dir, "design_comparison_batch_2.pdf"),
+  patchwork::wrap_plots(p, p_p, p_disp, ncol = 1),
+  width = 9, height = 13
+)
+```
+
+## NGFR+ vs NGFR- across cell lines
+
+FACS sorted NGFR+ and NGFR- Vemurafenib d14 samples are available for A375,
+COLO858 and WM115 (2 sort replicates each, WM989 only NGFR-). Use batch 1
+only.
+
+```{r fit-batch-1}
+meta_b1 <- deseq_meta |>
+  filter(sequencing_batch == "batch_1")
+
+deseq_b1 <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, meta_b1$sample_uid] |>
+    round(),
+  colData = meta_b1 |>
+    column_to_rownames("sample_uid"),
+  design = ~ 0 + condition
+) |>
+  DESeq()
+
+resultsNames(deseq_b1)
+```
+
+Per cell line contrasts, the A375 SingleClone d14 contrast as reference and the
+mean NGFR+ effect across the three cell lines.
+
+```{r contrasts-batch-1}
+ngfr_cell_lines <- c("A375", "COLO858", "WM115")
+coefs_ngfr_pos <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRpos_Vemurafenib_d14")
+coefs_ngfr_neg <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRneg_Vemurafenib_d14")
+coef_sc_pos <- "conditionA375_SingleClone_NGFRpos_Vemurafenib_d14"
+coef_sc_neg <- "conditionA375_SingleClone_NGFRneg_Vemurafenib_d14"
+
+stopifnot(
+  all(c(coefs_ngfr_pos, coefs_ngfr_neg, coef_sc_pos, coef_sc_neg) %in% resultsNames(deseq_b1))
+)
+
+de_contrasts_b1 <- bind_rows(
+  tibble(
+    contrast_id = ngfr_cell_lines,
+    contrast_name = paste("NGFR+ vs NGFR- |", ngfr_cell_lines),
+    contrast = map2(coefs_ngfr_pos, coefs_ngfr_neg, list),
+    res_args = list(list())
+  ),
+  tribble(
+    ~contrast_id, ~contrast_name, ~contrast, ~res_args,
+    "A375_SingleClone", "NGFR+ vs NGFR- | A375 SingleClone", list(coef_sc_pos, coef_sc_neg), list(),
+    "mean", "NGFR+ vs NGFR- | mean A375, COLO858, WM115", list(coefs_ngfr_pos, coefs_ngfr_neg), list(listValues = c(1 / 3, -1 / 3))
+  )
+)
+
+deseq_res_b1 <- run_contrasts(deseq_b1, de_contrasts_b1, gene_meta)
+```
+
 ### Comparing effects between inducers and batches
 
-Fold changes are compared rather than expression levels, so batch effects cancel out.
+Use `deseq_b2` for the inducer contrasts and `deseq_b1` for the A375 d14
+NGFR+ vs NGFR- contrast. Compare within-batch fold changes across the two runs.
 
-```{r}
+```{r compare-inducers}
 plot_lfc_scatter <- function(res, x_contrast, y_contrast) {
+  contrast_labels <- res |>
+    distinct(contrast_id, contrast_name) |>
+    deframe()
   df <- res |>
-    filter(contrast_name %in% c(x_contrast, y_contrast)) |>
+    filter(contrast_id %in% c(x_contrast, y_contrast)) |>
     transmute(
       gene_id, gene_label,
-      contrast = if_else(contrast_name == x_contrast, "x", "y"),
+      contrast = if_else(contrast_id == x_contrast, "x", "y"),
       log2FoldChange, padj
     ) |>
     pivot_wider(
@@ -929,27 +1006,26 @@ plot_lfc_scatter <- function(res, x_contrast, y_contrast) {
       values = c(none = "grey80", `x only` = "#2171B5", `y only` = "#1b9173", both = "#CB181D")
     ) +
     labs(
-      x = x_contrast, y = y_contrast,
+      x = contrast_labels[[x_contrast]], y = contrast_labels[[y_contrast]],
       title = paste0("Pearson r = ", signif(lfc_cor, 2))
     )
 }
 
 lfc_comparisons <- tribble(
   ~x_contrast, ~y_contrast,
-  "NGFR+ vs NGFR- | Vemurafenib", "NGFR+ vs NGFR- | IFNg",
-  "NGFR+ Vemurafenib vs NGFR- DMSO", "NGFR+ IFNg 100 vs NGFR- DMSO",
-  "NGFR- | Vemurafenib vs DMSO", "NGFR- | IFNg 100 vs DMSO",
-  "NGFR- | Vemurafenib vs DMSO", "NGFR- | TNFa vs DMSO",
-  "NGFR- | IFNg 100 vs DMSO", "NGFR- | TNFa vs DMSO",
-  "FACS A375 NGFR+ vs NGFR- Vemurafenib d14", "NGFR+ vs NGFR- | Vemurafenib"
+  "ngfr_vemu", "ngfr_ifng",
+  "pos_vemu_neg_dmso", "pos_ifng100_neg_dmso",
+  "neg_vemu_dmso", "neg_ifng100_dmso",
+  "neg_vemu_dmso", "neg_tnfa_dmso",
+  "neg_ifng100_dmso", "neg_tnfa_dmso",
+  "A375", "ngfr_vemu"
 )
 
 res_combined <- bind_rows(
-  deseq_res |>
-    select(contrast_name, gene_id, gene_label, log2FoldChange, padj),
+  deseq_res_b1 |>
+    select(contrast_id, contrast_name, gene_id, gene_label, log2FoldChange, padj),
   deseq_res_b2 |>
-    mutate(across(contrast_name, as.character)) |>
-    select(contrast_name, gene_id, gene_label, log2FoldChange, padj)
+    select(contrast_id, contrast_name, gene_id, gene_label, log2FoldChange, padj)
 )
 
 p <- lfc_comparisons |>
@@ -957,152 +1033,49 @@ p <- lfc_comparisons |>
   patchwork::wrap_plots(ncol = 2, guides = "collect")
 
 ggsave(
-  file.path(
-    plot_dir, "de_lfc_comparisons_batch_2.pdf"
-  ),
+  file.path(plot_dir, "de_lfc_comparisons_batch_2.pdf"),
   p, width = 14, height = 18
 )
 ```
 
-## NGFR+ vs NGFR- across cell lines
-
-FACS sorted NGFR+ and NGFR- Vemurafenib d14 samples are available for A375,
-COLO858 and WM115 (2 sort replicates each, WM989 only NGFR-). Use batch 1
-only
-
-```{r}
-meta_b1 <- deseq_meta |>
-  filter(sequencing_batch == "batch_1")
-
-deseq_b1 <- DESeqDataSetFromMatrix(
-  countData = count_mat[genes_eligible, meta_b1$sample_uid] |>
-    round(),
-  colData = meta_b1 |>
-    column_to_rownames("sample_uid"),
-  design = ~ 0 + condition
-) |>
-  DESeq()
-
-resultsNames(deseq_b1)
-```
-
-Per cell line contrasts, the A375 SingleClone d14 contrast as reference and the
-mean NGFR+ effect across the three cell lines.
-
-```{r}
-ngfr_cell_lines <- c("A375", "COLO858", "WM115")
-coefs_ngfr_pos <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRpos_Vemurafenib_d14")
-coefs_ngfr_neg <- paste0("condition", ngfr_cell_lines, "_FACS_NGFRneg_Vemurafenib_d14")
-coef_sc_pos <- "conditionA375_SingleClone_NGFRpos_Vemurafenib_d14"
-coef_sc_neg <- "conditionA375_SingleClone_NGFRneg_Vemurafenib_d14"
-
-stopifnot(
-  all(c(coefs_ngfr_pos, coefs_ngfr_neg, coef_sc_pos, coef_sc_neg) %in% resultsNames(deseq_b1))
-)
-
-de_contrasts_b1 <- bind_rows(
-  tibble(
-    contrast_id = ngfr_cell_lines,
-    contrast_name = paste("NGFR+ vs NGFR- |", ngfr_cell_lines),
-    contrast = map2(coefs_ngfr_pos, coefs_ngfr_neg, list),
-    res_args = list(list())
-  ),
-  tribble(
-    ~contrast_id, ~contrast_name, ~contrast, ~res_args,
-    "A375_SingleClone", "NGFR+ vs NGFR- | A375 SingleClone", list(coef_sc_pos, coef_sc_neg), list(),
-    "mean", "NGFR+ vs NGFR- | mean A375, COLO858, WM115", list(coefs_ngfr_pos, coefs_ngfr_neg), list(listValues = c(1 / 3, -1 / 3))
-  )
-)
-
-deseq_res_b1 <- de_contrasts_b1 |>
-  mutate(
-    res = map2(
-      contrast, res_args,
-      \(contrast, res_args) extract_deseq_result(
-        deseq_b1,
-        contrast = contrast,
-        res_args = res_args
-      )
-    )
-  ) |>
-  select(contrast_id, contrast_name, res) |>
-  unnest(res) |>
-  power_left_join(
-    gene_meta,
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  mutate(
-    contrast_name = fct_inorder(contrast_name),
-    gene_label = coalesce(gene_name, gene_id)
-  )
-```
-
-The per cell line fold changes should agree with the model of all samples.
-
-```{r}
-deseq_res_b1 |>
-  filter(contrast_id %in% ngfr_cell_lines) |>
-  inner_join(
-    deseq_res |>
-      filter(str_detect(contrast_name, "^FACS \\S+ NGFR\\+ vs NGFR- Vemurafenib d14$")) |>
-      transmute(
-        contrast_id = str_extract(contrast_name, "^FACS (\\S+)", group = 1),
-        gene_id, log2FoldChange, padj
-      ),
-    by = c("contrast_id", "gene_id"), suffix = c("_b1", "_all")
-  ) |>
-  group_by(contrast_id) |>
-  summarise(
-    lfc_cor = cor(log2FoldChange_b1, log2FoldChange_all, use = "complete.obs"),
-    n_sig_b1 = sum(padj_b1 < .05, na.rm = TRUE),
-    n_sig_all = sum(padj_all < .05, na.rm = TRUE)
-  )
-```
+### Shared NGFR+ signature across cell lines
 
 Genes with a shared NGFR+ signature across all three cell lines, i.e. changed
 in the same direction in each (intersection-union test, maximum of the three
 p-values). Pretty conservative.
 
-```{r}
+```{r shared-cell-line-signature}
 ngfr_shared_cell_lines <- deseq_res_b1 |>
   filter(contrast_id %in% ngfr_cell_lines) |>
-  group_by(gene_id, gene_label) |>
-  summarize(
-    log2FoldChange_min = sign(log2FoldChange[1]) * min(abs(log2FoldChange)),
-    same_direction = n_distinct(sign(log2FoldChange)) == 1,
-    n_lines_sig = sum(coalesce(padj, 1) < .05),
-    pvalue = if_else(same_direction, max(pvalue), 1),
-    .groups = "drop"
-  ) |>
-  mutate(
-    padj = p.adjust(pvalue, method = "BH")
-  ) |>
-  arrange(padj)
+  shared_signature() |>
+  rename(n_lines_sig = n_contrasts_sig)
 
-ngfr_shared_cell_lines
+write_csv(
+  ngfr_shared_cell_lines,
+  file.path(plot_dir, "de_results_batch_1_cell_lines_ngfr_shared.csv.gz")
+)
 
 bind_rows(
-  deseq_res_b1 |>
-    mutate(across(contrast_name, as.character)),
+  summarize_de(deseq_res_b1),
   ngfr_shared_cell_lines |>
-    mutate(contrast_name = "NGFR+ vs NGFR- | shared A375, COLO858, WM115")
-) |>
-  group_by(contrast_name) |>
-  summarise(
-    n_sig = sum(padj < .05, na.rm = TRUE),
-    n_up = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) > 0, na.rm = TRUE),
-    n_down = sum(padj < .05 & coalesce(log2FoldChange, log2FoldChange_min) < 0, na.rm = TRUE)
-  )
+    mutate(contrast_name = "NGFR+ vs NGFR- | shared A375, COLO858, WM115") |>
+    summarize_de(effect = log2FoldChange_min)
+)
 ```
+
+contrast_name                                n_sig  n_up n_down
+  <chr>                                        <int> <int>  <int>
+1 NGFR+ vs NGFR- | A375                         2382  1033   1349
+2 NGFR+ vs NGFR- | A375 SingleClone             7069  3285   3784
+3 NGFR+ vs NGFR- | COLO858                      2603  1295   1308
+4 NGFR+ vs NGFR- | WM115                        3448  1483   1965
+5 NGFR+ vs NGFR- | mean A375, COLO858, WM115    5059  2305   2754
+6 NGFR+ vs NGFR- | shared A375, COLO858, WM115   182    94     88
 
 Overlap of the per cell line significant genes and correlation of the fold
 changes between cell lines.
 
-```{r}
+```{r cell-line-overlap}
 deseq_res_b1 |>
   filter(contrast_id %in% ngfr_cell_lines, padj < .05) |>
   group_by(gene_id) |>
@@ -1124,30 +1097,25 @@ deseq_res_b1 |>
   cor(use = "pairwise.complete.obs")
 ```
 
-```{r}
-p <- combn(paste("NGFR+ vs NGFR- |", ngfr_cell_lines), 2) |>
+```{r compare-cell-lines}
+p <- combn(ngfr_cell_lines, 2) |>
   t() |>
   magrittr::set_colnames(c("x_contrast", "y_contrast")) |>
   as_tibble() |>
   pmap(
     \(x_contrast, y_contrast) plot_lfc_scatter(
-      deseq_res_b1 |>
-        mutate(across(contrast_name, as.character)),
-      x_contrast, y_contrast
+      deseq_res_b1, x_contrast, y_contrast
     )
   ) |>
   patchwork::wrap_plots(ncol = 3, guides = "collect")
 
 ggsave(
-  file.path(
-    plot_dir, "de_lfc_comparisons_cell_lines.pdf"
-  ),
+  file.path(plot_dir, "de_lfc_comparisons_cell_lines.pdf"),
   p, width = 20, height = 7
 )
 ```
 
-
-```{r}
+```{r shared-signature-heatmap}
 ngfr_shared_top <- ngfr_shared_cell_lines |>
   filter(
     same_direction,
@@ -1159,27 +1127,25 @@ ngfr_shared_top <- ngfr_shared_cell_lines |>
   arrange(log2FoldChange_min)
 
 ngfr_heatmap_columns <- c(
-  "NGFR+ vs NGFR- | A375" = "A375 d14",
-  "NGFR+ vs NGFR- | COLO858" = "COLO858 d14",
-  "NGFR+ vs NGFR- | WM115" = "WM115 d14",
-  "NGFR+ vs NGFR- | mean A375, COLO858, WM115" = "Mean d14",
-  "NGFR+ vs NGFR- | A375 SingleClone" = "A375 SingleClone d14",
-  "NGFR+ vs NGFR- | Vemurafenib" = "A375 d7 (batch 2)"
+  "A375" = "A375 d14",
+  "COLO858" = "COLO858 d14",
+  "WM115" = "WM115 d14",
+  "mean" = "Mean d14",
+  "A375_SingleClone" = "A375 SingleClone d14",
+  "ngfr_vemu" = "A375 d7 (batch 2)"
 )
 
 p <- bind_rows(
-  deseq_res_b1 |>
-    mutate(across(contrast_name, as.character)),
-  deseq_res_b2 |>
-    mutate(across(contrast_name, as.character))
+  deseq_res_b1,
+  deseq_res_b2
 ) |>
   filter(
-    contrast_name %in% names(ngfr_heatmap_columns),
+    contrast_id %in% names(ngfr_heatmap_columns),
     gene_id %in% ngfr_shared_top$gene_id
   ) |>
   mutate(
     column = factor(
-      ngfr_heatmap_columns[contrast_name],
+      ngfr_heatmap_columns[contrast_id],
       levels = ngfr_heatmap_columns
     ),
     gene_id = factor(gene_id, levels = ngfr_shared_top$gene_id)
@@ -1206,14 +1172,12 @@ p <- bind_rows(
 p
 
 ggsave(
-  file.path(
-    plot_dir, "ngfr_shared_cell_lines_lfc.pdf"
-  ),
+  file.path(plot_dir, "ngfr_shared_cell_lines_lfc.pdf"),
   p, width = 6, height = 12
 )
 ```
 
-```{r}
+```{r shared-signature-expression}
 p <- ngfr_shared_cell_lines |>
   filter(same_direction) |>
   group_by(sign(log2FoldChange_min)) |>
@@ -1222,14 +1186,12 @@ p <- ngfr_shared_cell_lines |>
   plot_gene_expression()
 
 ggsave(
-  file.path(
-    plot_dir, "gene_expression_ngfr_shared_cell_lines.pdf"
-  ),
+  file.path(plot_dir, "gene_expression_ngfr_shared_cell_lines.pdf"),
   p, width = 12, height = 16
 )
 ```
 
-```{r}
+```{r export-cell-line-results}
 deseq_res_b1 |>
   select(contrast_id, gene_id, gene_label, log2FoldChange, padj) |>
   pivot_wider(
@@ -1250,13 +1212,11 @@ deseq_res_b1 |>
   ) |>
   arrange(padj_shared) |>
   write_csv(
-    file.path(
-      plot_dir, "de_results_ngfr_shared_cell_lines.csv.gz"
-    )
+    file.path(plot_dir, "de_results_ngfr_shared_cell_lines.csv.gz")
   )
 ```
 
-## NGFR- Vemurafenib vs DMSO beyond the acute drug response
+## NGFR- Vemurafenib vs DMSO removing Vemu effect
 
 The d7 contrast NGFR- Vemurafenib vs NGFR- DMSO mixes the direct
 pharmacological response to BRAF inhibition with what is specific to the NGFR-
@@ -1264,24 +1224,26 @@ cells persisting under Vemurafenib. The acute A375 Vemurafenib vs DMSO d3
 samples (batch 1, unsorted) serve as reference for the drug response. Only fold
 changes are compared across batches, so additive batch effects should cancel.
 
-Caveats: The d7 DMSO baseline is also FACS sorted, so sorting effects cancel too.
+The d7 DMSO baseline is also FACS sorted, that sorting effect should
+cancel too.
 
-Caveats: the acute samples are d3, unsorted and from a different experiment and
+The acute samples are d3, unsorted and from a different experiment and
 library prep, so differences to the acute response also include d3 to d7
-adaptation and experiment-to-experiment variation.
+adaptation.
 
 ### Difference-in-differences
 
-Joint model of all libraries (re-sequenced libraries only counted once, no
-W_1). Conditions are nested within batch, so batch is absorbed by the
-condition term and only within-batch differences enter the contrasts. This
-test assumes the drug signature has the same magnitude at d3 and d7.
+Joint model of all libraries (re-sequenced libraries only counted once).
+Conditions are nested within batch, so batch is absorbed by the
+condition term.
 
-```{r}
+We assume here that the drug signature has the same magnitude at d3 and d7.
+
+```{r fit-all}
 meta_joint <- deseq_meta |>
   filter(!(sequencing_batch == "batch_2" & library_prep_batch == 1))
 
-deseq_joint <- DESeqDataSetFromMatrix(
+deseq_all <- DESeqDataSetFromMatrix(
   countData = count_mat[genes_eligible, meta_joint$sample_uid] |>
     round(),
   colData = meta_joint |>
@@ -1295,60 +1257,33 @@ coef_neg_dmso_d7 <- "conditionA375_FACS_NGFRneg_DMSO_d7"
 coef_acute_vemu <- "conditionA375_Acute_unsorted_Vemurafenib_d3"
 coef_acute_dmso <- "conditionA375_Acute_unsorted_DMSO_d3"
 
-de_contrasts_joint <- tribble(
+de_contrasts_all <- tribble(
   ~contrast_id, ~contrast_name, ~contrast,
-  "d7", "NGFR- Vemurafenib vs DMSO d7", list(coef_neg_vemu_d7, coef_neg_dmso_d7),
-  "acute", "Acute Vemurafenib vs DMSO d3", list(coef_acute_vemu, coef_acute_dmso),
-  "did", "NGFR- Vemurafenib d7 effect - acute Vemurafenib effect", list(c(coef_neg_vemu_d7, coef_acute_dmso), c(coef_neg_dmso_d7, coef_acute_vemu))
-)
+  "vemu_d7", "NGFR- Vemurafenib vs DMSO d7", list(coef_neg_vemu_d7, coef_neg_dmso_d7),
+  "vemu_acute", "Acute Vemurafenib vs DMSO d3", list(coef_acute_vemu, coef_acute_dmso),
+  "vemu_did", "NGFR- Vemurafenib d7 effect - acute Vemurafenib effect", list(c(coef_neg_vemu_d7, coef_acute_dmso), c(coef_neg_dmso_d7, coef_acute_vemu))
+) |>
+  mutate(res_args = list(list()))
 
-deseq_res_joint <- de_contrasts_joint |>
-  mutate(
-    res = map(
-      contrast,
-      \(contrast) extract_deseq_result(deseq_joint, contrast = contrast)
-    )
-  ) |>
-  select(contrast_id, contrast_name, res) |>
-  unnest(res) |>
-  power_left_join(
-    gene_meta,
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  mutate(
-    contrast_name = fct_inorder(contrast_name),
-    gene_label = coalesce(gene_name, gene_id)
-  )
+deseq_res_all <- run_contrasts(deseq_all, de_contrasts_all, gene_meta)
 
-deseq_res_joint |>
-  group_by(contrast_name) |>
-  summarise(
-    n_sig = sum(padj < .05, na.rm = TRUE),
-    n_up = sum(padj < .05 & log2FoldChange > 0, na.rm = TRUE),
-    n_down = sum(padj < .05 & log2FoldChange < 0, na.rm = TRUE)
-  )
+summarize_de(deseq_res_all)
 
 write_csv(
-  deseq_res_joint,
-  file.path(
-    plot_dir, "de_results_ngfrneg_vemu_beyond_acute.csv.gz"
-  )
+  deseq_res_all,
+  file.path(plot_dir, "de_results_ngfrneg_vemu_difference.csv.gz")
 )
 ```
 
 The joint model pools dispersions across batches. The d7 contrast should agree
 with the batch 2 only model.
 
-```{r}
-deseq_res_joint |>
-  filter(contrast_name == "NGFR- Vemurafenib vs DMSO d7") |>
+```{r validate-d7-effect}
+deseq_res_all |>
+  filter(contrast_id == "vemu_d7") |>
   inner_join(
     deseq_res_b2 |>
-      filter(contrast_name == "NGFR- | Vemurafenib vs DMSO"),
+      filter(contrast_id == "neg_vemu_dmso"),
     by = "gene_id", suffix = c("_joint", "_b2")
   ) |>
   summarise(
@@ -1359,45 +1294,48 @@ deseq_res_joint |>
   )
 ```
 
-```{r}
-p <- ggplot(
-  deseq_res_joint,
-  aes(
-    x = log2FoldChange,
-    y = -log10(padj)
+# A tibble: 1 × 4
+  lfc_cor n_sig_joint n_sig_b2 n_sig_both
+    <dbl>       <int>    <int>      <int>
+1   0.971        2658     3634       2445
+
+Compare the per-cell-line fold changes from `deseq_b1` with the joint
+model `deseq_all`, which uses no RUV adjustment.
+
+```{r validate-cell-line-effects}
+deseq_res_all_cell_lines <- run_contrasts(
+  deseq_all,
+  de_contrasts_b1 |> filter(contrast_id %in% ngfr_cell_lines),
+  gene_meta
+)
+
+deseq_res_b1 |>
+  filter(contrast_id %in% ngfr_cell_lines) |>
+  inner_join(
+    deseq_res_all_cell_lines |>
+      select(contrast_id, gene_id, log2FoldChange, padj),
+    by = c("contrast_id", "gene_id"), suffix = c("_b1", "_all")
+  ) |>
+  group_by(contrast_id) |>
+  summarise(
+    lfc_cor = cor(log2FoldChange_b1, log2FoldChange_all, use = "complete.obs"),
+    n_sig_b1 = sum(padj_b1 < .05, na.rm = TRUE),
+    n_sig_all = sum(padj_all < .05, na.rm = TRUE)
   )
-) +
-  rasterize(
-    geom_point(
-      aes(
-        color = padj < .05
-      ),
-      shape = 16,
-      alpha = .5
-    ), dpi = 300, device = "ragg_png"
-  ) +
-  geom_text_repel(
-    aes(
-      label = gene_label
-    ),
-    size = 3,
-    max.overlaps = Inf,
-    data = \(df) group_by(df, contrast_name, log2FoldChange > 0) |>
-      arrange(padj, pvalue) |>
-      slice_head(n = 10)
-  ) +
-  scale_color_manual(
-    values = c(`FALSE` = "black", `TRUE` = "red")
-  ) +
-  facet_wrap(
-    ~contrast_name,
-    scales = "free"
-  )
+```
+
+# A tibble: 3 × 4
+  contrast_id lfc_cor n_sig_b1 n_sig_all
+  <chr>         <dbl>    <int>     <int>
+1 A375          0.995     2382      2574
+2 COLO858       0.994     2603      2795
+3 WM115         0.997     3448      3646
+
+```{r volcano-all}
+p <- plot_volcano(deseq_res_all)
 
 ggsave(
-  file.path(
-    plot_dir, "de_volcano_ngfrneg_vemu_beyond_acute.pdf"
-  ),
+  file.path(plot_dir, "de_volcano_ngfrneg_vemu_difference.pdf"),
   p, width = 16, height = 6
 )
 ```
@@ -1426,13 +1364,13 @@ NGFR+ vs NGFR- (Vemurafenib) fold changes at d7 (batch 2 model) and d14
 (joint model, batch 1 samples), used below to relate the classes to the NGFR+
 state.
 
-```{r}
+```{r ngfr-axes}
 ngfr_axes <- bind_rows(
   d7 = deseq_res_b2 |>
-    filter(contrast_name == "NGFR+ vs NGFR- | Vemurafenib") |>
+    filter(contrast_id == "ngfr_vemu") |>
     select(gene_id, log2FoldChange),
   d14 = extract_deseq_result(
-    deseq_joint,
+    deseq_all,
     contrast = c(
       "condition",
       "A375_FACS_NGFRpos_Vemurafenib_d14",
@@ -1449,9 +1387,9 @@ ngfr_axes <- bind_rows(
   )
 ```
 
-```{r}
-drug_response_classes <- deseq_res_joint |>
-  filter(contrast_id %in% c("d7", "acute", "did")) |>
+```{r classify-drug-response}
+drug_response_classes <- deseq_res_all |>
+  filter(contrast_id %in% c("vemu_d7", "vemu_acute", "vemu_did")) |>
   select(gene_id, gene_label, contrast_id, log2FoldChange, padj) |>
   pivot_wider(
     names_from = contrast_id,
@@ -1459,14 +1397,14 @@ drug_response_classes <- deseq_res_joint |>
   ) |>
   mutate(
     across(starts_with("padj_"), \(x) coalesce(x, 1)),
-    sig_d7 = padj_d7 < .05,
-    sig_acute = padj_acute < .05,
-    sig_did = padj_did < .05,
+    sig_d7 = padj_vemu_d7 < .05,
+    sig_acute = padj_vemu_acute < .05,
+    sig_did = padj_vemu_did < .05,
     response_class = case_when(
-      sig_d7 & sig_acute & sign(log2FoldChange_d7) != sign(log2FoldChange_acute) ~ "opposite",
+      sig_d7 & sig_acute & sign(log2FoldChange_vemu_d7) != sign(log2FoldChange_vemu_acute) ~ "opposite",
       sig_d7 & sig_acute & !sig_did ~ "persistent drug response",
       sig_d7 & sig_acute & sig_did ~ "persistent, different magnitude",
-      sig_d7 & !sig_acute & abs(log2FoldChange_acute) < 0.5 & sig_did ~ "NGFR- d7 specific",
+      sig_d7 & !sig_acute & abs(log2FoldChange_vemu_acute) < 0.5 & sig_did ~ "NGFR- d7 specific",
       sig_acute & !sig_d7 & sig_did ~ "acute only",
       TRUE ~ "other"
     ) |>
@@ -1488,12 +1426,17 @@ drug_response_classes <- deseq_res_joint |>
   )
 
 drug_response_classes |>
-  count(response_class, direction_d7 = sign(log2FoldChange_d7))
+  count(response_class, direction_d7 = sign(log2FoldChange_vemu_d7))
 
 drug_response_classes |>
   filter(response_class == "NGFR- d7 specific") |>
-  arrange(padj_did) |>
-  select(gene_label, log2FoldChange_d7, log2FoldChange_acute, padj_d7, padj_did, starts_with("log2FoldChange_ngfr_axis"))
+  arrange(padj_vemu_did) |>
+  select(gene_label, log2FoldChange_vemu_d7, log2FoldChange_vemu_acute, padj_vemu_d7, padj_vemu_did, starts_with("log2FoldChange_ngfr_axis"))
+
+write_csv(
+  drug_response_classes,
+  file.path(plot_dir, "ngfrneg_vemu_drug_response_classes.csv.gz")
+)
 ```
 
 Are the NGFR- d7 specific changes related to the NGFR+ vs NGFR- axis? A
@@ -1505,30 +1448,23 @@ Vemurafenib samples with the d7 contrast (NGFR- Vemurafenib - DMSO) with
 opposite sign, so noise in these samples alone produces a negative correlation.
 The d14 axis comes from independent samples (batch 1) and is not affected.
 
-```{r}
+```{r summarize-drug-response}
 drug_response_classes |>
   group_by(response_class) |>
   summarize(
     n = n(),
     across(
       starts_with("log2FoldChange_ngfr_axis_"),
-      \(x) cor(log2FoldChange_d7, x, use = "complete.obs"),
+      \(x) cor(log2FoldChange_vemu_d7, x, use = "complete.obs"),
       .names = "cor_with_{str_remove(.col, 'log2FoldChange_')}"
     )
   )
-
-write_csv(
-  drug_response_classes,
-  file.path(
-    plot_dir, "ngfrneg_vemu_drug_response_classes.csv.gz"
-  )
-)
 ```
 
-```{r}
+```{r plot-drug-response}
 p <- drug_response_classes |>
   arrange(desc(response_class)) |>
-  ggplot(aes(log2FoldChange_acute, log2FoldChange_d7)) +
+  ggplot(aes(log2FoldChange_vemu_acute, log2FoldChange_vemu_d7)) +
   geom_hline(yintercept = 0, color = "grey70") +
   geom_vline(xintercept = 0, color = "grey70") +
   geom_abline(slope = 1, intercept = 0, color = "grey70", linetype = "dashed") +
@@ -1541,8 +1477,8 @@ p <- drug_response_classes |>
     size = 3,
     max.overlaps = Inf,
     data = \(df) filter(df, response_class == "NGFR- d7 specific") |>
-      group_by(log2FoldChange_d7 > 0) |>
-      slice_min(padj_did, n = 15, with_ties = FALSE)
+      group_by(log2FoldChange_vemu_d7 > 0) |>
+      slice_min(padj_vemu_did, n = 15, with_ties = FALSE)
   ) +
   scale_color_manual(
     values = c(
@@ -1563,9 +1499,7 @@ p <- drug_response_classes |>
 p
 
 ggsave(
-  file.path(
-    plot_dir, "lfc_ngfrneg_vemu_vs_acute_classes.pdf"
-  ),
+  file.path(plot_dir, "lfc_ngfrneg_vemu_vs_acute_classes.pdf"),
   p, width = 10, height = 8
 )
 ```
@@ -1577,7 +1511,7 @@ are still suppressed at d7, the acute signature is a reasonable reference for
 the drug response and these genes should be classified as persistent drug
 response.
 
-```{r}
+```{r mapk-genes}
 mpas_genes <- c(
   "PHLDA1", "SPRY2", "SPRY4", "DUSP4", "DUSP6",
   "CCND1", "EPHA2", "EPHA4", "ETV4", "ETV5"
@@ -1593,9 +1527,7 @@ drug_response_classes |>
 p <- plot_gene_expression(mpas_genes)
 
 ggsave(
-  file.path(
-    plot_dir, "gene_expression_mpas.pdf"
-  ),
+  file.path(plot_dir, "gene_expression_mpas.pdf"),
   p, width = 12, height = 20
 )
 ```
