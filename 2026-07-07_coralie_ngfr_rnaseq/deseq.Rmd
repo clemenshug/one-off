@@ -207,7 +207,7 @@ deseq_meta$size_factor <- sizeFactors(deseq_norm)[deseq_meta$sample_uid]
 
 write_csv(
   deseq_meta,
-  file.path(plot_dir, "deseq_meta.csv")
+  file.path(plot_dir, "sample_metadata_with_ruv_w1_and_size_factors.csv")
 )
 ```
 
@@ -751,7 +751,7 @@ deseq_res_b2_ngfr_shared <- deseq_res_b2 |>
 
 write_csv(
   deseq_res_b2_ngfr_shared,
-  file.path(plot_dir, "de_results_batch_2_ngfr_shared.csv.gz")
+  file.path(plot_dir, "de_a375_d7_ngfrpos_vs_ngfrneg_shared_vemu_and_ifng.csv.gz")
 )
 ```
 
@@ -765,7 +765,7 @@ bind_rows(
 
 write_csv(
   deseq_res_b2,
-  file.path(plot_dir, "de_results_batch_2.csv.gz")
+  file.path(plot_dir, "de_a375_d7_inducers_all_contrasts_long.csv.gz")
 )
 ```
 
@@ -1052,7 +1052,7 @@ ngfr_shared_cell_lines <- deseq_res_b1 |>
 
 write_csv(
   ngfr_shared_cell_lines,
-  file.path(plot_dir, "de_results_batch_1_cell_lines_ngfr_shared.csv.gz")
+  file.path(plot_dir, "de_d14_vemu_ngfrpos_vs_ngfrneg_shared_3_cell_lines.csv.gz")
 )
 
 bind_rows(
@@ -1212,7 +1212,7 @@ deseq_res_b1 |>
   ) |>
   arrange(padj_shared) |>
   write_csv(
-    file.path(plot_dir, "de_results_ngfr_shared_cell_lines.csv.gz")
+    file.path(plot_dir, "de_d14_vemu_ngfrpos_vs_ngfrneg_per_cell_line_and_shared_wide.csv.gz")
   )
 ```
 
@@ -1271,7 +1271,7 @@ summarize_de(deseq_res_all)
 
 write_csv(
   deseq_res_all,
-  file.path(plot_dir, "de_results_ngfrneg_vemu_difference.csv.gz")
+  file.path(plot_dir, "de_a375_ngfrneg_d7_vemu_effect_minus_acute_d3_vemu_effect_long.csv.gz")
 )
 ```
 
@@ -1349,16 +1349,16 @@ while many acute responders are back to baseline. A single scaling factor of
 the drug signature therefore doesn't describe the data. Instead, genes are
 classified using the d7 and acute contrasts and the difference-in-differences:
 
-- *persistent drug response*: changed in both, same direction, no significant
+- persistent drug response: changed in both, same direction, no significant
   difference between them
-- *persistent, different magnitude*: changed in both, same direction, but
+- persistent, different magnitude: changed in both, same direction, but
   significantly stronger or weaker at d7
-- *NGFR- d7 specific*: changed at d7 but not acutely (|acute log2FC| < 0.5),
+- NGFR- d7 specific: changed at d7 but not acutely (|acute log2FC| < 0.5),
   significant difference-in-differences. These are the candidates for what
   distinguishes NGFR- Vemurafenib persisters beyond the drug response.
-- *acute only*: changed acutely but not at d7, significant
+- acute only: changed acutely but not at d7, significant
   difference-in-differences (transient drug response)
-- *opposite*: changed in both in opposite directions
+- opposite: changed in both in opposite directions
 
 NGFR+ vs NGFR- (Vemurafenib) fold changes at d7 (batch 2 model) and d14
 (joint model, batch 1 samples), used below to relate the classes to the NGFR+
@@ -1435,7 +1435,7 @@ drug_response_classes |>
 
 write_csv(
   drug_response_classes,
-  file.path(plot_dir, "ngfrneg_vemu_drug_response_classes.csv.gz")
+  file.path(plot_dir, "a375_ngfrneg_d7_vemu_response_classes_vs_acute_d3.csv.gz")
 )
 ```
 
